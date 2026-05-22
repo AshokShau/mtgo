@@ -581,11 +581,13 @@ func (a *adapterWrapper) DCID() (int, error) {
 func (a *adapterWrapper) SetDCID(v int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if err := a.load(); err != nil {
-		return err
+	if a.sess == nil {
+		if err := a.load(); err != nil {
+			return err
+		}
 	}
 	a.sess.DC = v
-	return a.save()
+	return nil
 }
 func (a *adapterWrapper) APIID() (int32, error) {
 	a.mu.Lock()
