@@ -7,7 +7,6 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,78 +48,7 @@ const (
 	initialSaltFetchWait = 15 * time.Second
 	saltFetchInterval    = time.Hour
 	ackFlushInterval     = 30 * time.Second
-	housekeeperTick      = time.Second
-
-	defaultDispatchQueueSize = 256
 )
-
-var defaultHousekeeper = newGlobalHousekeeper()
-
-type globalHousekeeper struct {
-	mu       sync.Mutex
-	sessions map[*Session]struct{}
-	once     sync.Once
-}
-
-func newGlobalHousekeeper() *globalHousekeeper {
-	return &globalHousekeeper{
-		sessions: make(map[*Session]struct{}),
-	}
-}
-
-func (h *globalHousekeeper) register(s *Session) {
-	h.mu.Lock()
-	h.sessions[s] = struct{}{}
-	h.mu.Unlock()
-	h.once.Do(func() {
-		go h.run()
-	})
-}
-
-func (h *globalHousekeeper) unregister(s *Session) {
-	h.mu.Lock()
-	delete(h.sessions, s)
-	h.mu.Unlock()
-}
-
-func (h *globalHousekeeper) hasSession(s *Session) bool {
-	h.mu.Lock()
-	_, ok := h.sessions[s]
-	h.mu.Unlock()
-	return ok
-}
-
-func (h *globalHousekeeper) snapshot() []*Session {
-	h.mu.Lock()
-	sessions := make([]*Session, 0, len(h.sessions))
-	for s := range h.sessions {
-		sessions = append(sessions, s)
-	}
-	h.mu.Unlock()
-	return sessions
-}
-
-func (h *globalHousekeeper) run() {
-	ticker := time.NewTicker(housekeeperTick)
-	defer ticker.Stop()
-
-	ackTicker := time.NewTicker(ackFlushInterval)
-	defer ackTicker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			now := time.Now()
-			for _, s := range h.snapshot() {
-				s.runScheduledMaintenance(now)
-			}
-		case <-ackTicker.C:
-			for _, s := range h.snapshot() {
-				s.flushAcks()
-			}
-		}
-	}
-}
 
 // hasDecodedResults returns true if any goroutine is waiting for a decoded TL
 // RPC result. Raw result waiters are tracked separately so they do not force
@@ -179,23 +107,11 @@ type Session struct {
 	// pending manages all outstanding RPC call lifecycles.
 	pending *PendingManager
 
-	// acks accumulates message IDs that need to be acknowledged.
-	acks []int64
-	// acksMu protects the acks slice.
-	acksMu sync.Mutex
-
 	// connected indicates whether the session is currently active.
 	connected atomic.Bool
 	// mu protects the mutable config fields below: authKey, authKeyID,
-	// transport, pingInterval, nextPing, nextSaltFetch, onUpdate,
-	// onDisconnect, onPanic.
+	// transport, pingInterval, onUpdate, onPanic.
 	mu sync.RWMutex
-	// stopOnce ensures cancel is closed exactly once.
-	stopOnce sync.Once
-	// wg tracks all goroutines spawned by start so Stop can wait for them.
-	wg sync.WaitGroup
-	// cancel is closed to signal background workers to stop.
-	cancel chan struct{}
 
 	// transport is the underlying network transport for sending/receiving data.
 	transport Transport
@@ -203,23 +119,35 @@ type Session struct {
 	// (RPC, service, ack, ping) acquires this mutex, writes directly, and
 	// releases it. No goroutine hop, no channel, no silent drops.
 	writeMux sync.Mutex
-	// dispatchCh is a bounded queue for raw messages that need TL decoding.
-	dispatchCh chan *tg.MTProtoMessageRaw
-	// dispatchWorkers is the number of workers that decode dispatchCh items.
-	dispatchWorkers int
-	// dispatchQueueSize is the capacity used when creating dispatchCh.
-	dispatchQueueSize int
-	// receiveErr receives the terminal receive loop error, if any.
-	receiveErr chan error
+
 	// pingInterval controls how often keep-alive pings are sent.
 	pingInterval time.Duration
-	// nextPing and nextSaltFetch are maintained by the global housekeeper.
-	nextPing      time.Time
-	nextSaltFetch time.Time
+	// pongTimeout is how long to wait for a pong before considering the
+	// connection dead.
+	pongTimeout time.Duration
+	// pingMux protects pingCbs.
+	pingMux sync.Mutex
+	// pingCbs maps pingID to a channel that is closed when the matching
+	// pong is received.
+	pingCbs map[int64]chan struct{}
+	// ackCh is a channel consumed by ackLoop to batch and send message
+	// acknowledgments.
+	ackCh chan int64
+	// done is closed exactly once in handleClose, signalling Send/SendRaw
+	// and service message writes to abort.
+	done chan struct{}
+
+	// runCancel cancels the context used by the background errgroup when
+	// Start/StartContext is used.
+	runCancel context.CancelFunc
+	// runDone is closed when the background run exits.
+	runDone chan struct{}
+	// group holds the errgroup created during runInit. runLoop adds remaining
+	// goroutines to it.
+	group *errGroup
+
 	// onUpdate is called when the server pushes unsolicited updates.
 	onUpdate func(tg.TLObject)
-	// onDisconnect is called when the transport connection dies (recv error or write failure).
-	onDisconnect func(error)
 	// updateSem bounds the number of concurrent update dispatch goroutines.
 	updateSem chan struct{}
 	// onPanic is called (if non-nil) when a dispatch goroutine panics.
@@ -235,16 +163,31 @@ func (s *Session) SetOnPanic(fn func(panicValue any)) {
 	s.mu.Unlock()
 }
 
-func (s *Session) SetLogger(l sessionLogger) {
+// SessionDone returns a channel that is closed when the background Run loop
+// exits. Callers can use this to detect session termination.
+func (s *Session) SessionDone() <-chan struct{} {
+	return s.runDone
+}
+
+// SetPingInterval configures the keep-alive ping interval. Must be called
+// before Connect/Start. Zero or negative disables pings.
+func (s *Session) SetPingInterval(d time.Duration) {
 	s.mu.Lock()
-	s.log = l
+	s.pingInterval = d
 	s.mu.Unlock()
 }
 
-// SetOnDisconnect sets a callback invoked when the transport connection dies.
-func (s *Session) SetOnDisconnect(fn func(error)) {
+// SetPongTimeout configures how long to wait for a pong before considering the
+// connection dead. Must be called before Connect/Start.
+func (s *Session) SetPongTimeout(d time.Duration) {
 	s.mu.Lock()
-	s.onDisconnect = fn
+	s.pongTimeout = d
+	s.mu.Unlock()
+}
+
+func (s *Session) SetLogger(l sessionLogger) {
+	s.mu.Lock()
+	s.log = l
 	s.mu.Unlock()
 }
 
@@ -275,25 +218,24 @@ func NewSession(dc DataCenter, st storage.Storage, deviceModel, appVersion, syst
 	binary.LittleEndian.PutUint64(encodedSidBytes[:], uint64(sid))
 
 	s := &Session{
-		dc:          dc,
-		storage:     st,
-		deviceModel: deviceModel,
-		appVersion:  appVersion,
-		systemLang:  systemLang,
-		langCode:    langCode,
-		authKey:     authKey,
-		sessionID:   sid,
-		sidBytes:    encodedSidBytes,
-		msgFactory:  NewMsgFactory(time.Now()),
+		dc:           dc,
+		storage:      st,
+		deviceModel:  deviceModel,
+		appVersion:   appVersion,
+		systemLang:   systemLang,
+		langCode:     langCode,
+		authKey:      authKey,
+		sessionID:    sid,
+		sidBytes:     encodedSidBytes,
+		msgFactory:   NewMsgFactory(time.Now()),
 		msgIDValidator: newMsgIDValidator(func() int64 {
 			return time.Now().Unix()
 		}),
 		pending:      NewPendingManager(),
-		cancel:       make(chan struct{}),
 		pingInterval: 60 * time.Second,
-		updateSem:    make(chan struct{}, 64),
+		pongTimeout:  30 * time.Second,
+		updateSem:    make(chan struct{}, 128),
 	}
-	s.SetDispatchConfig(0, 0)
 
 	if len(authKey) > 0 {
 		s.authKeyID = computeAuthKeyID(authKey)
@@ -302,47 +244,20 @@ func NewSession(dc DataCenter, st storage.Storage, deviceModel, appVersion, syst
 	return s, nil
 }
 
-// SetDispatchConfig configures the bounded TL decode worker pool used by the
-// receive path. Non-positive values keep the defaults: runtime.GOMAXPROCS(0)
-// workers and a queue capacity of 256.
-func (s *Session) SetDispatchConfig(workers, queueSize int) {
-	s.dispatchWorkers = resolveDispatchWorkers(workers)
-	s.dispatchQueueSize = resolveDispatchQueueSize(queueSize)
-}
-
-func resolveDispatchWorkers(workers int) int {
-	if workers > 0 {
-		return workers
-	}
-	if workers = runtime.GOMAXPROCS(0); workers > 0 {
-		return workers
-	}
-	return 1
-}
-
-func resolveDispatchQueueSize(queueSize int) int {
-	if queueSize > 0 {
-		return queueSize
-	}
-	return defaultDispatchQueueSize
-}
+// SetDispatchConfig is kept for API compatibility but is a no-op. The session
+// now uses goroutine-per-message dispatch instead of a worker pool.
+func (s *Session) SetDispatchConfig(_, _ int) {}
 
 func (s *Session) addAck(msgID int64) {
-	s.acksMu.Lock()
-	if s.acks == nil {
-		s.acks = make([]int64, 0, 64)
+	select {
+	case s.ackCh <- msgID:
+	default:
 	}
-	s.acks = append(s.acks, msgID)
-	s.acksMu.Unlock()
 }
 
-func (s *Session) drainAcks() []int64 {
-	s.acksMu.Lock()
-	acks := s.acks
-	s.acks = nil
-	s.acksMu.Unlock()
-	return acks
-}
+// SetOnDisconnect is kept for API compatibility but is a no-op. The session
+// now uses errgroup sibling goroutines; Run() returns on failure.
+func (s *Session) SetOnDisconnect(func(error)) {}
 
 // SetAuthKey replaces the current authorization key and recomputes its ID.
 // Passing an empty slice clears the key and its ID.
@@ -412,8 +327,8 @@ func (s *Session) sessionIDBytes() []byte {
 // Send encrypts and sends a TLObject as a single MTProto message, then waits
 // for the server's response. The msgID and seqNo identify the message.
 // ctx is used for cancellation: when cancelled after the message has been sent,
-// an RPCDropAnswerRequest is fired to inform the server the request is no longer
-// needed. Returns the raw response bytes or an error.
+// an RPCDropAnswerRequest is fired to inform the server the request is no
+// longer needed. Returns the raw response bytes or an error.
 func (s *Session) Send(ctx context.Context, msgID int64, seqNo uint32, body tg.TLObject, timeout time.Duration) (tg.TLObject, error) {
 	s.mu.RLock()
 	authKey := s.authKey
@@ -455,7 +370,7 @@ func (s *Session) Send(ctx context.Context, msgID int64, seqNo uint32, body tg.T
 		s.pending.Cancel(msgID)
 		s.sendRPCDrop(msgID)
 		return nil, ctx.Err()
-	case <-s.cancel:
+	case <-s.done:
 		s.pending.Reject(msgID, ErrSessionClosed)
 		<-handle.Done()
 		obj, _, err := handle.Result()
@@ -468,7 +383,7 @@ func (s *Session) Send(ctx context.Context, msgID int64, seqNo uint32, body tg.T
 
 func (s *Session) sendRPCDrop(reqMsgID int64) {
 	select {
-	case <-s.cancel:
+	case <-s.done:
 		return
 	default:
 	}
@@ -508,6 +423,7 @@ func (s *Session) handlePacket(msgID int64, seqNo uint32, body tg.TLObject) {
 
 	switch v := obj.(type) {
 	case *tg.Pong:
+		s.handlePong(v.PingID)
 		s.pending.Resolve(v.MsgID, v)
 	case tg.BadMsgNotificationClass:
 		switch bv := v.(type) {
@@ -557,7 +473,7 @@ func (s *Session) handlePacket(msgID int64, seqNo uint32, body tg.TLObject) {
 }
 
 // dispatchUpdate spawns a goroutine to deliver an update to the handler,
-// bounded by the updateSem semaphore. If 64 dispatches are already in
+// bounded by the updateSem semaphore. If 128 dispatches are already in
 // flight, the update is dropped.
 func (s *Session) dispatchUpdate(obj tg.TLObject) {
 	s.mu.RLock()
@@ -624,7 +540,7 @@ func (s *Session) SendRaw(ctx context.Context, msgID int64, seqNo uint32, bodyBy
 		s.pending.Cancel(msgID)
 		s.sendRPCDrop(msgID)
 		return nil, ctx.Err()
-	case <-s.cancel:
+	case <-s.done:
 		s.pending.Reject(msgID, ErrSessionClosed)
 		<-handle.Done()
 		_, raw, err := handle.Result()
@@ -764,10 +680,80 @@ func typeName(v tg.TLObject) string {
 	}
 }
 
-// Start launches the receive and writer background workers, registers the
-// session with the global housekeeper, and performs an initial ping to verify
-// connectivity. Returns an error if the initial ping fails, in which case the
-// session is stopped automatically.
+// runInit validates state, initializes internal channels, sets connected, and
+// performs the initial ping to verify connectivity. It starts the errgroup
+// goroutines before the ping so that readLoop can receive the pong.
+func (s *Session) runInit(groupCtx context.Context) error {
+	return s.runInitWithCtx(groupCtx, groupCtx)
+}
+
+// runInitWithCtx is like runInit but separates the ping timeout context from
+// the errgroup context. pingCtx bounds the initial ping; groupCtx drives the
+// errgroup goroutines.
+func (s *Session) runInitWithCtx(pingCtx, groupCtx context.Context) error {
+	s.mu.RLock()
+	authKey := s.authKey
+	tp := s.transport
+	s.mu.RUnlock()
+	if len(authKey) == 0 {
+		return ErrAuthKeyNotSet
+	}
+	if tp == nil {
+		return ErrTransportNotSet
+	}
+
+	s.ackCh = make(chan int64, 1024)
+	s.pingCbs = make(map[int64]chan struct{})
+	s.done = make(chan struct{})
+	s.connected.Store(true)
+
+	// Start the errgroup so readLoop is running during the initial ping.
+	g := newErrGroup(groupCtx)
+	g.Go(s.readLoop)
+	g.Go(s.ackLoop)
+
+	s.group = g
+
+	initPingCtx, initPingCancel := context.WithTimeout(pingCtx, 60*time.Second)
+	_, err := s.Invoke(initPingCtx, &tg.PingRequest{PingID: time.Now().UnixNano()}, 3, timeoutFromContext(pingCtx))
+	initPingCancel()
+	if err != nil {
+		g.Cancel()
+		s.connected.Store(false)
+		close(s.done)
+		return fmt.Errorf("session: initial ping: %w", err)
+	}
+
+	return nil
+}
+
+// runLoop adds the remaining errgroup goroutines and blocks until the context
+// is cancelled or a goroutine returns a fatal error.
+func (s *Session) runLoop(ctx context.Context) error {
+	g := s.group
+	g.Go(s.pingLoop)
+	g.Go(s.saltLoop)
+	g.Go(s.handleClose)
+
+	err := g.Wait()
+	s.connected.Store(false)
+	return err
+}
+
+// Run is the main blocking entry point. It performs the initial ping
+// synchronously, then starts the remaining errgroup sibling goroutines
+// (pingLoop, saltLoop, handleClose) and blocks until the context is cancelled
+// or a fatal error occurs.
+func (s *Session) Run(ctx context.Context) error {
+	if err := s.runInit(ctx); err != nil {
+		return err
+	}
+	return s.runLoop(ctx)
+}
+
+// Start launches the session in a background goroutine and returns after the
+// initial ping succeeds. The timeout bounds the startup phase. Use Stop to
+// terminate the background session.
 func (s *Session) Start(timeout time.Duration) error {
 	ctx := context.Background()
 	if timeout > 0 {
@@ -775,64 +761,37 @@ func (s *Session) Start(timeout time.Duration) error {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	return s.start(context.Background(), ctx)
+	return s.StartContext(ctx)
 }
 
-// StartContext launches the receive and writer background workers, registers
-// the session with the global housekeeper, and performs an initial ping to
-// verify connectivity. It returns after the session is ready.
+// StartContext launches the session in a background goroutine and returns
+// after the initial ping succeeds. The ctx bounds the startup ping. Use Stop
+// to terminate the background session.
 func (s *Session) StartContext(ctx context.Context) error {
-	return s.start(context.Background(), ctx)
-}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	s.runCancel = runCancel
+	s.runDone = make(chan struct{})
 
-func (s *Session) start(loopCtx, pingCtx context.Context) error {
-	s.cancel = make(chan struct{})
-	s.dispatchCh = make(chan *tg.MTProtoMessageRaw, s.dispatchQueueSize)
-	s.receiveErr = make(chan error, 1)
-	s.connected.Store(true)
-
-	s.startDispatchWorkers(loopCtx, s.dispatchWorkers)
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		var err error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("session: receive loop panic: %v", r)
-				}
-			}()
-			err = s.receiveLoop(loopCtx)
-		}()
-		s.receiveErr <- err
-	}()
-
-	timeout := timeoutFromContext(pingCtx)
-	_, err := s.Invoke(pingCtx, &tg.PingRequest{PingID: time.Now().UnixNano()}, 3, timeout)
-	if err != nil {
-		s.Stop()
-		return fmt.Errorf("session: start: initial ping failed: %w", err)
+	// Use the caller's context for ping timeout but runCtx for the errgroup
+	// so the goroutines survive after the caller's context expires.
+	if err := s.runInitWithCtx(ctx, runCtx); err != nil {
+		runCancel()
+		return err
 	}
-	s.mu.Lock()
-	s.nextPing = time.Now().Add(s.pingInterval)
-	s.nextSaltFetch = time.Now().Add(initialSaltFetchWait)
-	s.mu.Unlock()
-	defaultHousekeeper.register(s)
+	go func() {
+		defer close(s.runDone)
+		s.runLoop(runCtx)
+	}()
 	return nil
 }
 
-// Run starts the session and blocks until ctx is canceled.
-func (s *Session) Run(ctx context.Context) error {
-	if err := s.start(ctx, ctx); err != nil {
-		return err
+// Stop cancels the background context and waits for the session to exit.
+func (s *Session) Stop() {
+	if s.runCancel != nil {
+		s.runCancel()
 	}
-	select {
-	case err := <-s.receiveErr:
-		s.Stop()
-		return err
-	case <-ctx.Done():
-		s.Stop()
-		return ctx.Err()
+	if s.runDone != nil {
+		<-s.runDone
 	}
 }
 
@@ -846,37 +805,6 @@ func timeoutFromContext(ctx context.Context) time.Duration {
 	return 60 * time.Second
 }
 
-// Stop signals all background workers to exit, closes the cancel channel,
-// and closes the underlying transport.
-func (s *Session) Stop() {
-	s.connected.Store(false)
-	defaultHousekeeper.unregister(s)
-	s.pending.RejectAll(ErrSessionClosed)
-	s.stopOnce.Do(func() {
-		if s.cancel != nil {
-			close(s.cancel)
-		}
-	})
-	s.mu.RLock()
-	tp := s.transport
-	s.mu.RUnlock()
-	if tp != nil {
-		tp.Close()
-	}
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		if s.log != nil {
-			s.log.Warnf("Stop: timed out waiting for goroutines to exit")
-		}
-	}
-}
-
 func (s *Session) storeFutureSalts(fs *tg.FutureSalts) {
 	if len(fs.Salts) == 0 {
 		return
@@ -886,7 +814,7 @@ func (s *Session) storeFutureSalts(fs *tg.FutureSalts) {
 
 func (s *Session) sendServiceMessage(body tg.TLObject) {
 	select {
-	case <-s.cancel:
+	case <-s.done:
 		return
 	default:
 	}
@@ -906,52 +834,6 @@ func (s *Session) sendServiceMessage(body tg.TLObject) {
 		return
 	}
 	_ = s.writeEncryptedDirect(encrypted, 10*time.Second)
-}
-
-func (s *Session) runScheduledMaintenance(now time.Time) {
-	select {
-	case <-s.cancel:
-		return
-	default:
-	}
-	s.mu.Lock()
-	if !s.nextSaltFetch.IsZero() && !now.Before(s.nextSaltFetch) {
-		s.nextSaltFetch = now.Add(saltFetchInterval)
-		s.mu.Unlock()
-		s.sendServiceMessage(&tg.GetFutureSaltsRequest{Num: numFutureSalts})
-		s.mu.Lock()
-	}
-	pingInterval := s.pingInterval
-	if pingInterval <= 0 {
-		pingInterval = 60 * time.Second
-	}
-	if !s.nextPing.IsZero() && !now.Before(s.nextPing) {
-		s.nextPing = now.Add(pingInterval)
-		s.mu.Unlock()
-		s.sendPing()
-		return
-	}
-	s.mu.Unlock()
-}
-
-func (s *Session) flushAcks() {
-	select {
-	case <-s.cancel:
-		return
-	default:
-	}
-	acks := s.drainAcks()
-	const maxAckBatch = 8192
-	for len(acks) > 0 {
-		batch := acks
-		if len(batch) > maxAckBatch {
-			batch = batch[:maxAckBatch]
-			acks = acks[maxAckBatch:]
-		} else {
-			acks = nil
-		}
-		s.sendServiceMessage(&tg.MsgsAck{MsgIds: batch})
-	}
 }
 
 // writeEncrypted snapshots transport state, acquires writeMux, sets the write
@@ -975,7 +857,7 @@ func (s *Session) writeEncrypted(ctx context.Context, encrypted []byte, timeout 
 	defer s.writeMux.Unlock()
 
 	select {
-	case <-s.cancel:
+	case <-s.done:
 		return ErrSessionClosed
 	default:
 	}
@@ -1002,7 +884,7 @@ func (s *Session) writeEncryptedDirect(encrypted []byte, timeout time.Duration) 
 	defer s.writeMux.Unlock()
 
 	select {
-	case <-s.cancel:
+	case <-s.done:
 		return ErrSessionClosed
 	default:
 	}
@@ -1013,28 +895,213 @@ func (s *Session) writeEncryptedDirect(encrypted []byte, timeout time.Duration) 
 	return err
 }
 
-func (s *Session) startDispatchWorkers(ctx context.Context, workers int) {
-	if workers < 1 {
-		workers = 1
+// readLoop is an errgroup goroutine that reads from the transport and handles
+// or dispatches incoming messages.
+func (s *Session) readLoop(ctx context.Context) error {
+	readTimeout := s.pingInterval * 2
+	if readTimeout < 30*time.Second {
+		readTimeout = 30 * time.Second
 	}
-	for range workers {
-		s.wg.Add(1)
-		go s.dispatchWorker(ctx)
-	}
-}
 
-func (s *Session) dispatchWorker(ctx context.Context) {
-	defer s.wg.Done()
+	var handlers sync.WaitGroup
+	defer handlers.Wait()
+
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-s.cancel:
-			return
-		case raw := <-s.dispatchCh:
-			s.dispatchRaw(raw)
+			return ctx.Err()
+		default:
+		}
+
+		s.mu.RLock()
+		tp := s.transport
+		authKey := s.authKey
+		authKeyID := s.authKeyID
+		updateFn := s.onUpdate
+		s.mu.RUnlock()
+
+		tp.SetReadDeadline(time.Now().Add(readTimeout))
+		data, err := tp.Recv()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if !s.connected.Load() {
+				return nil
+			}
+			if isTimeoutError(err) {
+				return fmt.Errorf("session: read deadline exceeded: %w", err)
+			}
+			return err
+		}
+		if len(data) == 4 {
+			code := int32(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24)
+			if code < 0 {
+				continue
+			}
+			return fmt.Errorf("transport error: code %d", -code)
+		}
+
+		raw, decrypted, err := unpackIncomingMessageEnvelope(data, s.sessionIDBytes(), authKey, authKeyID)
+		if err != nil {
+			if _, ok := err.(*tgerr.SecurityCheckMismatch); ok {
+				return err
+			}
+			continue
+		}
+
+		if !s.msgIDValidator.Check(raw.MsgID) {
+			crypto.ReleaseAESBuf(decrypted)
+			continue
+		}
+
+		s.addAck(raw.MsgID)
+
+		rawHandled := s.handleRawPacket(raw.MsgID, raw.BodyRaw)
+		needsDecodedResult := s.hasDecodedResults()
+
+		crypto.ReleaseAESBuf(decrypted)
+
+		if rawHandled || (!needsDecodedResult && updateFn == nil) {
+			continue
+		}
+
+		if needsDecodedResult || updateFn != nil {
+			handlers.Add(1)
+			go func(raw *tg.MTProtoMessageRaw) {
+				defer handlers.Done()
+				s.dispatchRaw(raw)
+			}(raw)
 		}
 	}
+}
+
+// pingLoop is an errgroup goroutine that sends periodic keep-alive pings and
+// detects dead connections via pong timeouts.
+func (s *Session) pingLoop(ctx context.Context) error {
+	if s.pingInterval <= 0 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	delay := s.pingInterval + s.pongTimeout
+	ticker := time.NewTicker(s.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+
+		pingID := time.Now().UnixNano()
+		pongCh := make(chan struct{})
+
+		s.pingMux.Lock()
+		s.pingCbs[pingID] = pongCh
+		s.pingMux.Unlock()
+
+		s.sendServiceMessage(&tg.PingDelayDisconnectRequest{
+			PingID:          pingID,
+			DisconnectDelay: int32(delay.Seconds()),
+		})
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-pongCh:
+		case <-time.After(s.pongTimeout):
+			return fmt.Errorf("session: pong timeout")
+		}
+	}
+}
+
+// handlePong signals the pong channel for the given pingID.
+func (s *Session) handlePong(pingID int64) {
+	s.pingMux.Lock()
+	ch, ok := s.pingCbs[pingID]
+	if ok {
+		close(ch)
+		delete(s.pingCbs, pingID)
+	}
+	s.pingMux.Unlock()
+}
+
+// ackLoop is an errgroup goroutine that batches message acknowledgments and
+// sends them periodically or when the batch is full.
+func (s *Session) ackLoop(ctx context.Context) error {
+	var buf []int64
+	ticker := time.NewTicker(ackFlushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		batch := make([]int64, len(buf))
+		copy(batch, buf)
+		buf = buf[:0]
+		s.sendServiceMessage(&tg.MsgsAck{MsgIds: batch})
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return ctx.Err()
+		case msgID := <-s.ackCh:
+			buf = append(buf, msgID)
+			if len(buf) >= 8192 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// saltLoop is an errgroup goroutine that periodically requests future salts
+// from the server.
+func (s *Session) saltLoop(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(initialSaltFetchWait):
+	}
+
+	s.sendServiceMessage(&tg.GetFutureSaltsRequest{Num: numFutureSalts})
+
+	ticker := time.NewTicker(saltFetchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			s.sendServiceMessage(&tg.GetFutureSaltsRequest{Num: numFutureSalts})
+		}
+	}
+}
+
+// handleClose is an errgroup goroutine that waits for context cancellation
+// and performs cleanup: marks disconnected, rejects pending RPCs, closes the
+// done channel, and closes the transport.
+func (s *Session) handleClose(ctx context.Context) error {
+	<-ctx.Done()
+	s.connected.Store(false)
+	s.pending.RejectAll(ErrSessionClosed)
+	close(s.done)
+	s.mu.RLock()
+	tp := s.transport
+	s.mu.RUnlock()
+	if tp != nil {
+		tp.Close()
+	}
+	return nil
 }
 
 func (s *Session) dispatchRaw(raw *tg.MTProtoMessageRaw) {
@@ -1101,9 +1168,11 @@ func (s *Session) handleRawPacket(msgID int64, body []byte) bool {
 		if len(body) < 20 {
 			return false
 		}
+		pingID := int64(binary.LittleEndian.Uint64(body[12:20]))
+		s.handlePong(pingID)
 		s.pending.Resolve(int64(binary.LittleEndian.Uint64(body[4:12])), &tg.Pong{
 			MsgID:  int64(binary.LittleEndian.Uint64(body[4:12])),
-			PingID: int64(binary.LittleEndian.Uint64(body[12:20])),
+			PingID: pingID,
 		})
 	case tg.BadMsgNotificationTypeID:
 		if len(body) < 20 {
@@ -1303,129 +1372,6 @@ func (s *Session) handleRawMsgResendReq(body []byte) {
 	for _, id := range msgIDs {
 		s.addAck(id)
 	}
-}
-
-func (s *Session) receiveLoop(ctx context.Context) error {
-	var lastDisconnect time.Time
-
-	s.mu.RLock()
-	pingInterval := s.pingInterval
-	s.mu.RUnlock()
-	readTimeout := pingInterval * 2
-	if readTimeout < 30*time.Second {
-		readTimeout = 30 * time.Second
-	}
-
-	retryTimer := time.NewTimer(0)
-	if !retryTimer.Stop() {
-		<-retryTimer.C
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			retryTimer.Stop()
-			return ctx.Err()
-		case <-s.cancel:
-			retryTimer.Stop()
-			return nil
-		default:
-		}
-
-		s.mu.RLock()
-		tp := s.transport
-		disconnFn := s.onDisconnect
-		authKey := s.authKey
-		authKeyID := s.authKeyID
-		updateFn := s.onUpdate
-		s.mu.RUnlock()
-
-		tp.SetReadDeadline(time.Now().Add(readTimeout))
-		data, err := tp.Recv()
-		if err != nil {
-			if !s.connected.Load() {
-				retryTimer.Stop()
-				return nil
-			}
-			if isTimeoutError(err) {
-				retryTimer.Stop()
-				return fmt.Errorf("session: read deadline exceeded: %w", err)
-			}
-			if disconnFn != nil && time.Since(lastDisconnect) > time.Second {
-				disconnFn(err)
-				lastDisconnect = time.Now()
-			}
-			retryTimer.Reset(100 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				retryTimer.Stop()
-				return ctx.Err()
-			case <-s.cancel:
-				retryTimer.Stop()
-				return nil
-			case <-retryTimer.C:
-			}
-			continue
-		}
-		if len(data) == 4 {
-			code := int32(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24)
-			if code < 0 {
-				continue
-			}
-			if disconnFn != nil {
-				disconnFn(fmt.Errorf("transport error: code %d", -code))
-			}
-			return fmt.Errorf("transport error: code %d", -code)
-		}
-
-		raw, decrypted, err := unpackIncomingMessageEnvelope(data, s.sessionIDBytes(), authKey, authKeyID)
-		if err != nil {
-			if _, ok := err.(*tgerr.SecurityCheckMismatch); ok {
-				if disconnFn != nil {
-					disconnFn(err)
-				}
-				return err
-			}
-			continue
-		}
-
-		if !s.msgIDValidator.Check(raw.MsgID) {
-			crypto.ReleaseAESBuf(decrypted)
-			continue
-		}
-
-		s.addAck(raw.MsgID)
-
-		rawHandled := s.handleRawPacket(raw.MsgID, raw.BodyRaw)
-		needsDecodedResult := s.hasDecodedResults()
-
-		crypto.ReleaseAESBuf(decrypted)
-
-		if rawHandled || (!needsDecodedResult && updateFn == nil) {
-			continue
-		}
-
-		if needsDecodedResult || updateFn != nil {
-			select {
-			case s.dispatchCh <- raw:
-			default:
-				s.dispatchRaw(raw)
-			}
-		}
-	}
-}
-
-func (s *Session) sendPing() {
-	s.sendServiceMessage(&tg.PingDelayDisconnectRequest{
-		PingID:          time.Now().UnixNano(),
-		DisconnectDelay: 65,
-	})
-}
-
-func (s *Session) setPingInterval(d time.Duration) {
-	s.mu.Lock()
-	s.pingInterval = d
-	s.mu.Unlock()
 }
 
 func isTimeoutError(err error) bool {

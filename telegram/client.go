@@ -105,7 +105,6 @@ type Client struct {
 	stopOnce sync.Once
 
 	reconnectMgr  *reconnectManager
-	healthCheck   *healthChecker
 	updateManager *updateManager
 
 	autoConnectMu sync.Mutex
@@ -421,17 +420,6 @@ func (c *Client) backoffConfig() backoffConfig {
 	return cfg
 }
 
-func (c *Client) healthConfig() healthCheckConfig {
-	cfg := defaultHealthCheckConfig
-	if c.cfg.HealthPingInterval != 0 {
-		cfg.PingInterval = c.cfg.HealthPingInterval
-	}
-	if c.cfg.HealthPongTimeout != 0 {
-		cfg.PongTimeout = c.cfg.HealthPongTimeout
-	}
-	return cfg
-}
-
 // IsConnected reports whether the client has an active connection to Telegram.
 func (c *Client) IsConnected() bool {
 	return c.state.isConnected()
@@ -693,7 +681,9 @@ func configureSessionDispatch(sess *session.Session, cfg Config, log *Logger) {
 	if sess == nil {
 		return
 	}
-	sess.SetDispatchConfig(cfg.DispatchWorkers, cfg.DispatchQueueSize)
+	if cfg.DispatchWorkers > 0 {
+		sess.SetDispatchConfig(cfg.DispatchWorkers, cfg.DispatchQueueSize)
+	}
 	if log != nil {
 		sess.SetLogger(log)
 	}
@@ -1043,12 +1033,6 @@ func (c *Client) connectTransport(timeout time.Duration) error {
 	sess.SetUpdateHandler(func(obj tg.TLObject) {
 		c.processRawUpdate(obj)
 	})
-	sess.SetOnDisconnect(func(err error) {
-		c.Log.Warnf("session transport error: %v", err)
-		if c.state.IsConnected() {
-			c.triggerReconnect(err)
-		}
-	})
 	sess.SetOnPanic(func(r any) {
 		c.Log.Errorf("session dispatch panic: %v", r)
 	})
@@ -1056,12 +1040,29 @@ func (c *Client) connectTransport(timeout time.Duration) error {
 	c.mu.Lock()
 	c.apiInit = false
 	c.mu.Unlock()
+
+	// Configure session ping intervals from client config before starting.
+	if c.cfg.HealthPingInterval > 0 {
+		sess.SetPingInterval(c.cfg.HealthPingInterval)
+	}
+	if c.cfg.HealthPongTimeout > 0 {
+		sess.SetPongTimeout(c.cfg.HealthPongTimeout)
+	}
+
 	c.Log.Debug("starting encrypted session")
 	if err := sess.Connect(sessionTp, timeout); err != nil {
 		sessionTp.Close()
 		return fmt.Errorf("session start: %w", err)
 	}
 	c.Log.Info("encrypted session started")
+
+	// Watch for session exit and trigger reconnect when it dies.
+	go func() {
+		<-sess.SessionDone()
+		if c.state.IsConnected() {
+			c.triggerReconnect(fmt.Errorf("session exited"))
+		}
+	}()
 
 	// Publish session and mark connected under brief lock so that
 	// concurrent readers observe c.session and ConnStateConnected together.
@@ -1212,17 +1213,6 @@ func (c *Client) connectTransport(timeout time.Duration) error {
 		}
 	}
 
-	if c.cfg.HealthEnabled {
-		c.mu.Lock()
-		if c.healthCheck != nil {
-			c.healthCheck.Stop()
-		}
-		c.healthCheck = newHealthChecker(c, c.healthConfig())
-		hc := c.healthCheck
-		c.mu.Unlock()
-		hc.Start(context.Background())
-	}
-
 	return nil
 }
 
@@ -1260,9 +1250,6 @@ func (c *Client) cleanupSessions(closeStorage ...bool) {
 		c.updateManager.Stop(ctx)
 		cancel()
 		c.updateManager = nil
-	}
-	if c.healthCheck != nil {
-		c.healthCheck.Stop()
 	}
 	c.mu.Unlock()
 	if c.reconnectMgr != nil {

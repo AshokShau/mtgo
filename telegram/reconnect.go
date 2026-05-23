@@ -182,12 +182,6 @@ func (c *Client) reconnectOnce() error {
 	sess.SetUpdateHandler(func(obj tg.TLObject) {
 		c.processRawUpdate(obj)
 	})
-	sess.SetOnDisconnect(func(err error) {
-		c.Log.Warnf("session transport error: %v", err)
-		if c.state.IsConnected() {
-			c.triggerReconnect(err)
-		}
-	})
 	sess.SetOnPanic(func(r any) {
 		c.Log.Errorf("session dispatch panic: %v", r)
 	})
@@ -195,6 +189,15 @@ func (c *Client) reconnectOnce() error {
 	c.mu.Lock()
 	c.apiInit = false
 	c.mu.Unlock()
+
+	// Configure session ping intervals from client config before starting.
+	if c.cfg.HealthPingInterval > 0 {
+		sess.SetPingInterval(c.cfg.HealthPingInterval)
+	}
+	if c.cfg.HealthPongTimeout > 0 {
+		sess.SetPongTimeout(c.cfg.HealthPongTimeout)
+	}
+
 	if err := sess.Connect(sessionTp, 30*time.Second); err != nil {
 		sessionTp.Close()
 		return fmt.Errorf("session start: %w", err)
@@ -217,16 +220,13 @@ func (c *Client) reconnectOnce() error {
 		}
 	}
 
-	c.mu.Lock()
-	if c.healthCheck != nil {
-		c.healthCheck.Stop()
-	}
-	if c.healthCheck == nil {
-		c.healthCheck = newHealthChecker(c, c.healthConfig())
-	}
-	hc := c.healthCheck
-	c.mu.Unlock()
-	hc.Start(context.Background())
+	// Watch for session exit and trigger reconnect when it dies.
+	go func() {
+		<-sess.SessionDone()
+		if c.state.IsConnected() {
+			c.triggerReconnect(fmt.Errorf("session exited"))
+		}
+	}()
 
 	return nil
 }

@@ -249,41 +249,6 @@ func TestReconnectManagerMaxAttempts(t *testing.T) {
 	}
 }
 
-func TestHealthCheckerStartStop(t *testing.T) {
-	client, _ := NewClient(12345, "hash", &Config{InMemory: true})
-	hc := newHealthChecker(client, healthCheckConfig{
-		PingInterval: 10 * time.Millisecond,
-		PongTimeout:  5 * time.Millisecond,
-	})
-
-	hc.Start(context.Background())
-	if !hc.IsRunning() {
-		t.Fatal("should be running")
-	}
-
-	hc.Start(context.Background())
-
-	hc.Stop()
-	if hc.IsRunning() {
-		t.Fatal("should not be running after Stop")
-	}
-
-	hc.Stop()
-}
-
-func TestHealthCheckerStopsOnDisconnected(t *testing.T) {
-	client, _ := NewClient(12345, "hash", &Config{InMemory: true})
-	hc := newHealthChecker(client, healthCheckConfig{
-		PingInterval: 10 * time.Millisecond,
-		PongTimeout:  5 * time.Millisecond,
-	})
-
-	hc.Start(context.Background())
-	time.Sleep(50 * time.Millisecond)
-
-	hc.Stop()
-}
-
 func TestMigrationErrorParsing(t *testing.T) {
 	client, _ := NewClient(12345, "hash", &Config{InMemory: true})
 	client.state.SetConnecting(2)
@@ -442,9 +407,6 @@ func TestCloseStopsEverything(t *testing.T) {
 
 	if !client.state.IsClosed() {
 		t.Fatal("state should be closed after Close()")
-	}
-	if client.healthCheck != nil && client.healthCheck.IsRunning() {
-		t.Fatal("health checker should be stopped")
 	}
 	if client.reconnectMgr != nil && client.reconnectMgr.IsRunning() {
 		t.Fatal("reconnect manager should be stopped")
