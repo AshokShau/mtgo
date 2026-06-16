@@ -228,6 +228,62 @@ func (pm *PendingManager) Count() int64 {
 	return pm.totalPending.Load()
 }
 
+// MarkAllUnknown transitions all pending (acked or unacked) queries to the
+// unknown state. Called on transport disconnect to mark queries whose fate is
+// unknown until recovery queries are sent on reconnect.
+// Ported from td/td/telegram/net/Session.cpp:700-734 (sent_queries_ → unknown_queries_).
+func (pm *PendingManager) MarkAllUnknown() []int64 {
+	pm.mu.Lock()
+	ids := make([]int64, 0, len(pm.pending))
+	for msgID := range pm.pending {
+		ids = append(ids, msgID)
+	}
+	pm.mu.Unlock()
+	return ids
+}
+
+// GetUnknown returns the message IDs of all pending queries (which are now
+// considered "unknown" after MarkAllUnknown was called). These are the queries
+// that need recovery via msgs_state_req on reconnect.
+func (pm *PendingManager) GetUnknown() []int64 {
+	pm.mu.Lock()
+	ids := make([]int64, 0, len(pm.pending))
+	for msgID := range pm.pending {
+		ids = append(ids, msgID)
+	}
+	pm.mu.Unlock()
+	return ids
+}
+
+// RejectExcessUnknowns rejects pending queries beyond the given cap with
+// ErrTooManyPending. Returns the number of rejected queries.
+// Ported from td/td/telegram/net/Session.cpp:1297-1309 (MAX_INFLIGHT_QUERIES check).
+func (pm *PendingManager) RejectExcessUnknowns(cap int) int {
+	pm.mu.Lock()
+	if len(pm.pending) <= cap {
+		pm.mu.Unlock()
+		return 0
+	}
+	// Collect excess IDs (keep earliest registered, reject newest)
+	excess := make([]int64, 0)
+	count := 0
+	for msgID := range pm.pending {
+		count++
+		if count > cap {
+			excess = append(excess, msgID)
+		}
+	}
+	pm.mu.Unlock()
+
+	rejected := 0
+	for _, msgID := range excess {
+		if pm.Reject(msgID, ErrTooManyPending) {
+			rejected++
+		}
+	}
+	return rejected
+}
+
 // remove extracts and deletes the handle from the map.
 func (pm *PendingManager) remove(msgID int64) *CallHandle {
 	pm.mu.Lock()

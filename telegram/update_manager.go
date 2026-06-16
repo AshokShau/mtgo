@@ -19,6 +19,12 @@ type updateManagerConfig struct {
 	// GapBuffer is the duration to defer getDifference calls after detecting
 	// a PTS gap. Defaults to 500ms. Set to 0 to disable buffering.
 	GapBuffer time.Duration
+
+	// InboundQueue enables concurrent dispatch via a bounded worker pool.
+	// When non-nil and Enabled(), deliverUpdate routes dispatch through it
+	// instead of calling DispatchSafe inline. When nil/disabled, dispatch
+	// stays synchronous (current behavior — Constitution Principle IV).
+	InboundQueue *InboundUpdateQueue
 }
 
 // UpdateHealth holds diagnostic metrics about the update processing pipeline,
@@ -141,6 +147,12 @@ func (m *updateManager) Stop(ctx context.Context) error {
 	case <-m.done:
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	// Close the inbound dispatch queue (drains workers, no goroutine leak).
+	if m.cfg.InboundQueue != nil {
+		if err := m.cfg.InboundQueue.Close(); err != nil {
+			m.client.Log.Warnf("inbound queue close: %v", err)
+		}
 	}
 	return nil
 }
@@ -330,6 +342,29 @@ func (m *updateManager) deliverUpdate(container tg.UpdatesClass, raw tg.UpdateCl
 
 	upd := m.client.toUpdate(raw, userMap, chatMap, pm)
 
+	// When the inbound dispatch queue is enabled, route dispatch through it for
+	// concurrent handler execution with per-routing-key ordering (FR-005).
+	// Channel updates are keyed by ChannelID (per-channel order, concurrent
+	// across channels); common updates use key 0 (global pts/qts order).
+	if q := m.cfg.InboundQueue; q != nil && q.Enabled() {
+		routingKey := uint64(meta.ChannelID)
+		if err := q.Enqueue(routingKey, func() {
+			if derr := m.dispatchUpdate(upd, meta); derr != nil {
+				m.client.Log.Warnf("async dispatch: %v", derr)
+			}
+		}); err != nil {
+			m.client.Log.Warnf("inbound queue enqueue failed: %v", err)
+		}
+		return nil
+	}
+
+	return m.dispatchUpdate(upd, meta)
+}
+
+// dispatchUpdate runs the handler dispatch with retries, post-dispatch cleanup
+// (durable delete, state advance), and error recording. Called either inline
+// (synchronous path) or from an InboundUpdateQueue worker (concurrent path).
+func (m *updateManager) dispatchUpdate(upd *Update, meta updateMeta) error {
 	var lastErr error
 	for attempt := 0; attempt <= m.cfg.MaxHandlerRetry; attempt++ {
 		err := m.client.handlerDispatcher.DispatchSafe(m.client, upd)

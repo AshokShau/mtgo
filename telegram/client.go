@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mtgo-labs/mtgo/internal/crypto"
 	"github.com/mtgo-labs/mtgo/internal/session"
 	"github.com/mtgo-labs/mtgo/internal/transport"
 	"github.com/mtgo-labs/mtgo/mtproxy"
@@ -119,6 +120,30 @@ type Client struct {
 	secretChatReqHandlers []SecretChatRequestHandler
 
 	dcSessions *dcSessions
+
+	// dcOptionPool manages candidate endpoints per DC with health scoring.
+	// Ported from td/td/telegram/net/DcOptionsSet.h.
+	dcOptionPool *session.DCOptionPool
+	// connPool caches warm connections to avoid redundant TCP handshakes.
+	// Ported from td/td/telegram/net/ConnectionCreator.cpp.
+	connPool *session.ConnectionPool
+	// sessionRouter routes queries to the appropriate session slot per DC.
+	// Ported from td/td/telegram/net/NetQueryDispatcher.h.
+	sessionRouter *session.SessionRouter
+	// dcAuthManager tracks exported authorization state for non-main DCs.
+	// Ported from td/td/telegram/net/DcAuthManager.h.
+	dcAuthManager *session.DcAuthManager
+
+	// keySet is the trusted server RSA key store for DH fingerprint verification
+	// and rotation. When nil, the bundled static keys are used (backward compat).
+	// Constructed when Config.RSAKeyRotationInterval > 0.
+	keySet *crypto.RSAKeySet
+	// keyWatchdog periodically refreshes server RSA keys when non-nil.
+	keyWatchdog       *crypto.PublicRsaKeyWatchdog
+	keyWatchdogCancel context.CancelFunc
+	// overloadController gates RPC admission by priority when non-nil.
+	// Constructed when Config.MaxInFlightRPCs > 0.
+	overloadController *OverloadController
 
 	testStorage  storage.Storage
 	testSession  *session.Session
@@ -220,12 +245,46 @@ func NewClient(apiID int32, apiHash string, cfg *Config) (*Client, error) {
 		resolveCoalescer:  resolveCoalescer{inFlight: make(map[string][]chan resolveResult)},
 		handlerDispatcher: NewHandlerDispatcher(),
 		dcSessions:        newDCSessions(),
+		dcOptionPool:      session.NewDCOptionPool(2, c.EndpointCoolDown),
+		connPool:          session.NewConnectionPool(c.ConnPoolTTL),
+		sessionRouter:     session.NewSessionRouter(5 * time.Minute),
 		Log:               logger,
 		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
+	client.dcAuthManager = session.NewDcAuthManager(2, func(ctx context.Context, fromDC, toDC int) (*tg.AuthExportedAuthorization, error) {
+		return client.Raw().AuthExportAuthorization(ctx, &tg.AuthExportAuthorizationRequest{
+			DCID: int32(toDC),
+		})
+	}, nil, logger)
+
 	client.initSecretChats()
 	client.reconnectMgr = newReconnectManager(client, client.backoffConfig())
+
+	// Production hardening: enable RSA key rotation watchdog when configured.
+	if c.RSAKeyRotationInterval > 0 {
+		client.keySet = crypto.NewRSAKeySet()
+		client.keyWatchdog = crypto.NewPublicRsaKeyWatchdog(crypto.WatchdogConfig{
+			KeySet:   client.keySet,
+			Interval: c.RSAKeyRotationInterval,
+			FetchFn:  nil, // No key-distribution RPC wired yet; watchdog ticks harmlessly.
+			Log: func(format string, args ...any) {
+				logger.Debugf("rsa watchdog: "+format, args...)
+			},
+		})
+	}
+
+	// Production hardening: enable overload control when configured.
+	if c.MaxInFlightRPCs > 0 {
+		client.overloadController = NewOverloadController(OverloadConfig{
+			Ceilings: ResourceCeilings{
+				MaxInFlightRPCs: c.MaxInFlightRPCs,
+			},
+			AdmissionDeadline: c.AdmissionDeadline,
+			Log:               logger,
+		})
+	}
+
 	registerClient(client)
 
 	return client, nil
@@ -1048,32 +1107,52 @@ func (c *Client) initSession(st storage.Storage, testSession *session.Session) (
 // dialTransport establishes the underlying transport connection (TCP,
 // WebSocket, or MTProxy) to the given data center.
 func (c *Client) dialTransport(dc session.DataCenter, timeout time.Duration, testDialer transport.Dialer) (*sessionTransport, error) {
+	// Add this endpoint to the pool if not already present.
+	c.dcOptionPool.AddOption(dc)
+
+	// Check connection pool first (warm cache).
+	if cached, ok := c.connPool.Get(dc.ID, dc); ok {
+		if st, ok := cached.(*sessionTransport); ok {
+			c.Log.Debug("reusing cached connection for ", dc)
+			c.dcOptionPool.RecordSuccess(dc)
+			return st, nil
+		}
+	}
+
 	if useWebSocket(c.cfg) {
 		wsAddr := wsDCAddress(dc.ID, dc.TestMode, c.config().WebSocketTLS)
 		wsCtx, wsCancel := dialerCtx(timeout)
 		defer wsCancel()
 		wsConn, err := transport.DialWebsocket(wsCtx, wsAddr)
 		if err != nil {
+			c.dcOptionPool.RecordFailure(dc)
 			return nil, fmt.Errorf("ws dial %s: %w", wsAddr, err)
 		}
 		tp := transport.NewTCPIntermediateNoHeader(wsConn)
 		if err := tp.Connect(); err != nil {
 			wsConn.Close()
+			c.dcOptionPool.RecordFailure(dc)
 			return nil, fmt.Errorf("ws transport handshake: %w", err)
 		}
-		return newSessionTransport(tp, wsConn), nil
+		st := newSessionTransport(tp, wsConn)
+		c.dcOptionPool.RecordSuccess(dc)
+		return st, nil
 	}
 	if c.config().MTProxy != nil {
 		mpConn, err := mtproxy.Dial(c.config().MTProxy.Addr, c.config().MTProxy.Secret, dc.ID, timeout)
 		if err != nil {
+			c.dcOptionPool.RecordFailure(dc)
 			return nil, fmt.Errorf("mtproxy dial: %w", err)
 		}
 		tp := transport.NewTCPIntermediateNoHeader(mpConn)
 		if err := tp.Connect(); err != nil {
 			mpConn.Close()
+			c.dcOptionPool.RecordFailure(dc)
 			return nil, fmt.Errorf("mtproxy transport handshake: %w", err)
 		}
-		return newSessionTransport(tp, mpConn), nil
+		st := newSessionTransport(tp, mpConn)
+		c.dcOptionPool.RecordSuccess(dc)
+		return st, nil
 	}
 
 	addr := fmt.Sprintf("%s:%d", dc.Address(), dc.Port())
@@ -1086,18 +1165,27 @@ func (c *Client) dialTransport(dc session.DataCenter, timeout time.Duration, tes
 	}
 	conn, err := d.Dial("tcp", addr, timeout)
 	if err != nil {
+		c.dcOptionPool.RecordFailure(dc)
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 	tp, err := newTCPTransport(c.config().TransportMode, conn)
 	if err != nil {
 		conn.Close()
+		c.dcOptionPool.RecordFailure(dc)
 		return nil, err
 	}
 	if err := tp.Connect(); err != nil {
 		conn.Close()
+		c.dcOptionPool.RecordFailure(dc)
 		return nil, fmt.Errorf("transport handshake: %w", err)
 	}
-	return newSessionTransport(tp, conn), nil
+	st := newSessionTransport(tp, conn)
+	c.dcOptionPool.RecordSuccess(dc)
+
+	// Cache the connection for potential reuse.
+	c.connPool.Put(dc.ID, dc, st)
+
+	return st, nil
 }
 
 // performDHExchange runs the MTProto DH key exchange if no auth key exists or
@@ -1114,6 +1202,9 @@ func (c *Client) performDHExchange(sess *session.Session, st storage.Storage, dc
 	auth := &session.Auth{
 		DC:       dc.ID,
 		TestMode: dc.TestMode,
+	}
+	if c.keySet != nil {
+		auth.SetKeySet(c.keySet)
 	}
 	result, err := auth.Create(sessionTp)
 	if err != nil {
@@ -1304,8 +1395,31 @@ func (c *Client) authenticateUser(st storage.Storage, timeout time.Duration) err
 }
 
 // postConnect runs post-connection setup: fetching update state, starting
-// plugins, and enabling update recovery.
+// postConnect runs initialization steps after the session is connected: fetching
+// updates state, plugins, and enabling update recovery.
 func (c *Client) postConnect() {
+	// Start the RSA key rotation watchdog if configured.
+	if c.keyWatchdog != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		c.keyWatchdogCancel = cancel
+		c.keyWatchdog.Start(ctx)
+		c.Log.Debug("rsa key rotation watchdog started")
+	}
+
+	// Enable outbound container packing if configured.
+	if c.config().OutboundBatchEnabled {
+		c.mu.RLock()
+		sess := c.session
+		c.mu.RUnlock()
+		if sess != nil {
+			sess.EnableOutboundBatching(
+				c.config().OutboundMaxContainerBytes,
+				c.config().OutboundCoalesceWindow,
+			)
+			c.Log.Debug("outbound container packing enabled")
+		}
+	}
+
 	if !c.config().NoUpdates {
 		c.Log.Debug("fetching updates state")
 		rpc := c.Raw()
@@ -1327,11 +1441,21 @@ func (c *Client) postConnect() {
 	}
 
 	if c.config().UpdateRecoveryEnabled && !c.config().NoUpdates {
-		mgr := newUpdateManager(c, c.storage, updateManagerConfig{
+		umCfg := updateManagerConfig{
 			QueueSize:       c.config().UpdateQueueSize,
 			DurableQueue:    c.config().DurableUpdateQueue,
 			MaxHandlerRetry: c.config().MaxUpdateHandlerRetry,
-		})
+		}
+		// Enable the inbound dispatch queue when InboundQueueDepth > 0.
+		if c.config().InboundQueueDepth > 0 {
+			umCfg.InboundQueue = NewInboundUpdateQueue(InboundQueueConfig{
+				MaxDepth:    c.config().InboundQueueDepth,
+				Workers:     c.config().InboundQueueWorkers,
+				StallBudget: c.config().InboundStallBudget,
+				Log:         c.Log,
+			})
+		}
+		mgr := newUpdateManager(c, c.storage, umCfg)
 		if err := mgr.Start(context.Background()); err != nil {
 			c.Log.Warnf("update recovery start: %v", err)
 		} else {
@@ -1405,6 +1529,7 @@ func (c *Client) cleanupSessions(closeStorage ...bool) {
 	c.mu.Unlock()
 
 	if sess != nil {
+		sess.CloseOutboundBatching()
 		sess.Stop()
 	}
 	c.sessionWg.Wait()
@@ -1448,6 +1573,13 @@ func (c *Client) Disconnect() error {
 func (c *Client) Close() {
 	c.stopPlugins(context.Background())
 	c.cleanupSessions()
+	// Stop the RSA key rotation watchdog (no goroutine leak — Principle V).
+	if c.keyWatchdogCancel != nil {
+		c.keyWatchdogCancel()
+	}
+	if c.keyWatchdog != nil {
+		c.keyWatchdog.Wait()
+	}
 	c.state.SetClosed()
 }
 
@@ -1560,12 +1692,30 @@ func (c *Client) Invoke(ctx context.Context, query tg.TLObject, retries int, tim
 		return nil, err
 	}
 
+	// Route query to the appropriate session slot.
+	// Currently all slots share the same session, but the routing
+	// infrastructure is in place for future multi-session support.
+	slotType := session.RouteQuery(query)
+	_ = slotType // routing decision logged for future use
+
 	c.mu.RLock()
 	sess := c.session
+	oc := c.overloadController
 	c.mu.RUnlock()
 
 	if sess == nil {
 		return nil, ErrNotConnected
+	}
+
+	// Overload control: gate admission by priority (FR-018). When disabled
+	// (MaxInFlightRPCs == 0), Admit is a no-op (backward compat).
+	if oc != nil && oc.Enabled() {
+		priority := int(session.RoutePriority(query))
+		release, err := oc.Admit(ctx, priority)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 
 	result, err := sess.Invoke(ctx, query, retries, timeout)
@@ -1824,6 +1974,8 @@ func (c *Client) toUpdate(raw tg.UpdateClass, users map[int64]*types.User, chats
 		}
 	case *tg.UpdateBotInlineQuery:
 		upd.InlineQuery = &types.InlineQuery{ID: v.QueryID, UserID: v.UserID, Query: v.Query, Offset: v.Offset}
+	case *tg.UpdateBotInlineSend:
+		upd.ChosenInlineResult = types.ParseChosenInlineResult(v)
 	case *tg.UpdateUserStatus:
 		upd.UserStatus = &types.UserStatusUpdated{UserID: v.UserID}
 	case *tg.UpdateUserName:

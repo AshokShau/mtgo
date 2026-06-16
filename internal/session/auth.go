@@ -28,6 +28,26 @@ type authTransport interface {
 	Recv() ([]byte, error)
 }
 
+// ErrKeyVerificationFailed is the sentinel error returned when the server DH
+// exchange fingerprint does not match a key in the trusted set. Use
+// errors.Is(err, ErrKeyVerificationFailed) to detect MITM/trust failures.
+// Wraps crypto.ErrKeyVerificationFailed for cross-package detection.
+var ErrKeyVerificationFailed = crypto.ErrKeyVerificationFailed
+
+// KeyVerificationError provides details about a failed cryptographic key
+// verification. It wraps ErrKeyVerificationFailed so errors.Is works.
+type KeyVerificationError struct {
+	Expected []int64 // trusted fingerprints
+	Observed int64   // the server fingerprint that failed
+	Reason   string  // "fingerprint_mismatch" | "unverified_rotation"
+}
+
+func (e *KeyVerificationError) Error() string {
+	return fmt.Sprintf("session: key verification failed (%s): observed=%d, expected=%v", e.Reason, e.Observed, e.Expected)
+}
+
+func (e *KeyVerificationError) Unwrap() error { return ErrKeyVerificationFailed }
+
 // Auth performs the full MTProto DH key exchange to establish an authorization
 // key with a Telegram server.
 type Auth struct {
@@ -36,7 +56,14 @@ type Auth struct {
 	DC int
 	// TestMode indicates that the connection is using Telegram test servers.
 	TestMode bool
+	// keySet is the trusted-key set used for fingerprint verification. When
+	// nil, the static crypto.ServerPublicKeys map is used (backward compat).
+	keySet *crypto.RSAKeySet
 }
+
+// SetKeySet injects a custom trusted-key set for DH fingerprint verification
+// and RSA key rotation. When not called, the bundled static keys are used.
+func (a *Auth) SetKeySet(ks *crypto.RSAKeySet) { a.keySet = ks }
 
 func (a *Auth) innerDataDC() int32 {
 	dc := a.DC
@@ -107,11 +134,22 @@ func knownFingerprints() []int64 {
 
 func (a *Auth) findKeyFingerprint(fingerprints []int64) (int64, bool) {
 	for _, fp := range fingerprints {
-		if _, ok := crypto.GetServerKey(fp); ok {
+		if a.keySet != nil {
+			if a.keySet.IsTrusted(fp) {
+				return fp, true
+			}
+		} else if _, ok := crypto.GetServerKey(fp); ok {
 			return fp, true
 		}
 	}
 	return 0, false
+}
+
+func (a *Auth) trustedFingerprints() []int64 {
+	if a.keySet != nil {
+		return a.keySet.TrustedFingerprints()
+	}
+	return knownFingerprints()
 }
 
 func (a *Auth) generateRandomBN(bits int) (*big.Int, error) {
@@ -162,7 +200,13 @@ func (a *Auth) Create(conn authTransport) (*AuthResult, error) {
 
 	fp, ok := a.findKeyFingerprint(resPQ.ServerPublicKeyFingerprints)
 	if !ok {
-		return nil, fmt.Errorf("step 5: no matching key fingerprint (server=%v, known=%v)", resPQ.ServerPublicKeyFingerprints, knownFingerprints())
+		// Typed error for MITM detection (FR-014). Returns KeyVerificationError
+		// wrapping ErrKeyVerificationFailed so callers can errors.Is() it.
+		return nil, &KeyVerificationError{
+			Reason:   "fingerprint_mismatch",
+			Observed: 0,
+			Expected: a.trustedFingerprints(),
+		}
 	}
 
 	newNonce, err := randomInt256()

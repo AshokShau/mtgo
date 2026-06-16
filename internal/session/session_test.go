@@ -196,16 +196,53 @@ func TestSessionAckTracking(t *testing.T) {
 	}
 }
 
+func TestSessionRawMsgsAckCleansTrackedContainer(t *testing.T) {
+	s := newSessionWithAuthKey(t)
+	s.TrackContainer(1001, []int64{2001, 2002})
+
+	var body bytes.Buffer
+	tg.WriteVectorLong(&body, []int64{1001})
+	s.handleRawMsgsAck(body.Bytes())
+
+	if got := s.containerTracker.NackContainer(1001); len(got) != 0 {
+		t.Fatalf("NackContainer() after raw ACK = %v, want empty", got)
+	}
+}
+
+func TestSessionRawMsgResendReqNacksTrackedContainer(t *testing.T) {
+	s := newSessionWithAuthKey(t)
+	s.ackCh = make(chan int64, 1024)
+	s.TrackContainer(1001, []int64{2001, 2002})
+
+	var body bytes.Buffer
+	tg.WriteVectorLong(&body, []int64{1001})
+	s.handleRawMsgResendReq(body.Bytes())
+
+	if got := s.containerTracker.AckContainer(1001); len(got) != 0 {
+		t.Fatalf("AckContainer() after raw resend req = %v, want empty", got)
+	}
+	select {
+	case got := <-s.ackCh:
+		if got != 1001 {
+			t.Fatalf("ackCh got %d, want 1001", got)
+		}
+	default:
+		t.Fatal("ackCh missing resend request ack")
+	}
+}
+
 type mockTransport struct {
-	sendCh chan []byte
-	recvCh chan []byte
-	closed bool
+	sendCh    chan []byte
+	recvCh    chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func newMockTransport() *mockTransport {
 	return &mockTransport{
 		sendCh: make(chan []byte, 100),
 		recvCh: make(chan []byte, 100),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -217,21 +254,29 @@ func (m *mockTransport) Send(data []byte) error {
 }
 
 func (m *mockTransport) Recv() ([]byte, error) {
-	data, ok := <-m.recvCh
-	if !ok {
+	select {
+	case data, ok := <-m.recvCh:
+		if !ok {
+			return nil, fmt.Errorf("transport closed")
+		}
+		return data, nil
+	case <-m.done:
 		return nil, fmt.Errorf("transport closed")
 	}
-	return data, nil
 }
 
 func (m *mockTransport) Close() error {
-	m.closed = true
-	close(m.recvCh)
+	m.closeOnce.Do(func() { close(m.done) })
 	return nil
 }
 
 func (m *mockTransport) IsConnected() bool {
-	return !m.closed
+	select {
+	case <-m.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func (m *mockTransport) SetWriteDeadline(t time.Time) error {
@@ -316,7 +361,7 @@ func startTestWorkers(s *Session, mt *mockTransport) func() {
 	return func() {
 		cancel()
 		close(s.done)
-		close(mt.recvCh)
+		mt.Close() // safe via closeOnce; unblocks readLoop's Recv()
 	}
 }
 
@@ -1261,7 +1306,6 @@ func TestWriteCircuitBreakerDisabledWhenZero(t *testing.T) {
 }
 
 type panicTransport struct {
-	mu     sync.Mutex
 	closed bool
 }
 
@@ -1872,5 +1916,329 @@ func TestBatchAckSentOnNonUpdates(t *testing.T) {
 			}
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+}
+
+func TestPendingManagerMarkAllUnknown(t *testing.T) {
+	pm := NewPendingManager()
+
+	// Register 3 pending queries.
+	h1, err := pm.Register(1001, false)
+	if err != nil {
+		t.Fatalf("Register(1001): %v", err)
+	}
+	_ = h1
+	h2, err := pm.Register(1002, false)
+	if err != nil {
+		t.Fatalf("Register(1002): %v", err)
+	}
+	_ = h2
+	h3, err := pm.Register(1003, true)
+	if err != nil {
+		t.Fatalf("Register(1003): %v", err)
+	}
+	_ = h3
+
+	// Mark all as unknown.
+	ids := pm.MarkAllUnknown()
+	if len(ids) != 3 {
+		t.Fatalf("MarkAllUnknown: got %d ids, want 3", len(ids))
+	}
+
+	// GetUnknown should return the same IDs.
+	unknown := pm.GetUnknown()
+	if len(unknown) != 3 {
+		t.Fatalf("GetUnknown: got %d, want 3", len(unknown))
+	}
+}
+
+func TestPendingManagerRejectExcessUnknowns(t *testing.T) {
+	pm := NewPendingManager()
+
+	// Register 5 pending queries.
+	for i := int64(0); i < 5; i++ {
+		_, err := pm.Register(2001+i, false)
+		if err != nil {
+			t.Fatalf("Register(%d): %v", 2001+i, err)
+		}
+	}
+
+	// Mark all as unknown.
+	pm.MarkAllUnknown()
+
+	// Reject excess with cap of 3 — should reject 2.
+	rejected := pm.RejectExcessUnknowns(3)
+	if rejected != 2 {
+		t.Fatalf("RejectExcessUnknowns(3): rejected %d, want 2", rejected)
+	}
+
+	// Should have 3 remaining.
+	remaining := pm.GetUnknown()
+	if len(remaining) != 3 {
+		t.Fatalf("GetUnknown after reject: got %d, want 3", len(remaining))
+	}
+}
+
+func TestPendingManagerRejectExcessUnknownsUnderCap(t *testing.T) {
+	pm := NewPendingManager()
+
+	// Register 2 queries, cap is 5 — no rejection needed.
+	for i := int64(0); i < 2; i++ {
+		_, _ = pm.Register(3001+i, false)
+	}
+	pm.MarkAllUnknown()
+
+	rejected := pm.RejectExcessUnknowns(5)
+	if rejected != 0 {
+		t.Fatalf("RejectExcessUnknowns(5): rejected %d, want 0", rejected)
+	}
+
+	remaining := pm.GetUnknown()
+	if len(remaining) != 2 {
+		t.Fatalf("GetUnknown: got %d, want 2", len(remaining))
+	}
+}
+
+func TestSessionPrepareForReconnect(t *testing.T) {
+	s := newSessionWithAuthKey(t)
+	mt := newMockTransport()
+	s.SetTransport(mt)
+
+	cleanup := startTestWorkers(s, mt)
+	defer cleanup()
+
+	// Register some pending queries.
+	_, _ = s.pending.Register(4001, false)
+	_, _ = s.pending.Register(4002, false)
+	_, _ = s.pending.Register(4003, true)
+
+	// PrepareForReconnect should return all pending IDs.
+	ids := s.PrepareForReconnect()
+	if len(ids) != 3 {
+		t.Fatalf("PrepareForReconnect: got %d ids, want 3", len(ids))
+	}
+
+	// HasUnknownQueries should be true.
+	if !s.HasUnknownQueries() {
+		t.Fatal("HasUnknownQueries should be true")
+	}
+}
+
+func TestSessionHasUnknownQueriesEmpty(t *testing.T) {
+	s := newSessionWithAuthKey(t)
+	mt := newMockTransport()
+	s.SetTransport(mt)
+
+	cleanup := startTestWorkers(s, mt)
+	defer cleanup()
+
+	// No pending queries.
+	if s.HasUnknownQueries() {
+		t.Fatal("HasUnknownQueries should be false when no pending queries")
+	}
+}
+
+func TestSessionRecoveryRejectsQueryLostReconnect(t *testing.T) {
+	s := newSessionWithAuthKey(t)
+	mt := newMockTransport()
+	s.SetTransport(mt)
+
+	cleanup := startTestWorkers(s, mt)
+	defer cleanup()
+
+	// Register a pending query.
+	_, _ = s.pending.Register(5001, false)
+
+	// Simulate the recovery rejecting a query (as if state query failed).
+	// The query should be rejected with ErrQueryLostReconnect.
+	s.resendSingleQuery(5001)
+
+	// The pending query should be rejected.
+	// Verify by checking that the handle is completed.
+	// Note: we can't easily check the error without the handle reference,
+	// but we can verify the query is no longer pending.
+	if s.pending.Has(5001) {
+		t.Fatal("query 5001 should no longer be pending after resendSingleQuery")
+	}
+}
+
+func TestDCOptionPoolFindBest(t *testing.T) {
+	pool := NewDCOptionPool(2, 16*time.Second)
+
+	// Add 2 endpoints.
+	dc1 := DataCenter{ID: 2}
+	dc2 := DataCenter{ID: 2, IPv6: true}
+	pool.AddOption(dc1)
+	pool.AddOption(dc2)
+
+	// Both are untested — should return one of them.
+	best, err := pool.FindBest()
+	if err != nil {
+		t.Fatalf("FindBest: %v", err)
+	}
+	if best != dc1 && best != dc2 {
+		t.Fatalf("FindBest returned unexpected endpoint: %v", best)
+	}
+
+	// Record success on dc1.
+	pool.RecordSuccess(dc1)
+
+	// Now dc1 is Ok, dc2 is Untested — should prefer dc1.
+	best, err = pool.FindBest()
+	if err != nil {
+		t.Fatalf("FindBest after success: %v", err)
+	}
+	if best != dc1 {
+		t.Fatalf("FindBest should prefer dc1 (Ok), got %v", best)
+	}
+
+	// Record failure on dc1.
+	pool.RecordFailure(dc1)
+
+	// Now dc1 is Error, dc2 is Untested — should prefer dc2.
+	best, err = pool.FindBest()
+	if err != nil {
+		t.Fatalf("FindBest after failure: %v", err)
+	}
+	if best != dc2 {
+		t.Fatalf("FindBest should prefer dc2 (Untested), got %v", best)
+	}
+}
+
+func TestDCOptionPoolCoolDown(t *testing.T) {
+	pool := NewDCOptionPool(2, 100*time.Millisecond)
+
+	dc := DataCenter{ID: 2}
+	pool.AddOption(dc)
+
+	// Record failure.
+	pool.RecordFailure(dc)
+
+	// Should fail — all endpoints in cool-down.
+	_, err := pool.FindBest()
+	if err == nil {
+		t.Fatal("FindBest should fail when all endpoints in cool-down")
+	}
+
+	// Wait for cool-down to expire.
+	time.Sleep(150 * time.Millisecond)
+
+	// Should succeed now.
+	best, err := pool.FindBest()
+	if err != nil {
+		t.Fatalf("FindBest after cool-down: %v", err)
+	}
+	if best != dc {
+		t.Fatalf("FindBest returned unexpected endpoint: %v", best)
+	}
+}
+
+func TestConnectionPoolGetPut(t *testing.T) {
+	pool := NewConnectionPool(10 * time.Second)
+
+	dc := DataCenter{ID: 2}
+	conn := &mockTransport{}
+
+	// Cache miss.
+	_, ok := pool.Get(2, dc)
+	if ok {
+		t.Fatal("Get should return false on cache miss")
+	}
+
+	// Put.
+	pool.Put(2, dc, conn)
+
+	// Cache hit.
+	got, ok := pool.Get(2, dc)
+	if !ok {
+		t.Fatal("Get should return true on cache hit")
+	}
+	if got != conn {
+		t.Fatal("Get returned wrong connection")
+	}
+
+	// Second get should miss (consumed).
+	_, ok = pool.Get(2, dc)
+	if ok {
+		t.Fatal("Get should return false after consumption")
+	}
+}
+
+func TestConnectionPoolExpiry(t *testing.T) {
+	pool := NewConnectionPool(100 * time.Millisecond)
+
+	dc := DataCenter{ID: 2}
+	conn := &mockTransport{}
+
+	pool.Put(2, dc, conn)
+
+	// Wait for expiry.
+	time.Sleep(150 * time.Millisecond)
+
+	// Should miss (expired).
+	_, ok := pool.Get(2, dc)
+	if ok {
+		t.Fatal("Get should return false after expiry")
+	}
+}
+
+func TestConnectionPoolEvict(t *testing.T) {
+	pool := NewConnectionPool(10 * time.Second)
+
+	dc := DataCenter{ID: 2}
+	conn := &mockTransport{}
+
+	pool.Put(2, dc, conn)
+	pool.Evict(2, dc)
+
+	_, ok := pool.Get(2, dc)
+	if ok {
+		t.Fatal("Get should return false after Evict")
+	}
+}
+
+func TestConnectionPoolPurge(t *testing.T) {
+	pool := NewConnectionPool(100 * time.Millisecond)
+
+	dc := DataCenter{ID: 2}
+	pool.Put(2, dc, &mockTransport{})
+	pool.Put(2, DataCenter{ID: 2, IPv6: true}, &mockTransport{})
+
+	if pool.Count() != 2 {
+		t.Fatalf("Count before purge: %d, want 2", pool.Count())
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	purged := pool.Purge()
+	if purged != 2 {
+		t.Fatalf("Purge: %d, want 2", purged)
+	}
+	if pool.Count() != 0 {
+		t.Fatalf("Count after purge: %d, want 0", pool.Count())
+	}
+}
+
+func TestRouteQuery(t *testing.T) {
+	tests := []struct {
+		name  string
+		query tg.TLObject
+		want  SessionSlotType
+	}{
+		{"upload.saveFilePart", &tg.UploadSaveFilePartRequest{}, SlotUpload},
+		{"upload.saveBigFilePart", &tg.UploadSaveBigFilePartRequest{}, SlotUpload},
+		{"upload.getFile", &tg.UploadGetFileRequest{}, SlotDownload},
+		{"upload.getWebFile", &tg.UploadGetWebFileRequest{}, SlotDownload},
+		{"ping (main)", &tg.PingRequest{}, SlotMain},
+		{"sendMessage (main)", &tg.MessagesSendMessageRequest{}, SlotMain},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RouteQuery(tt.query)
+			if got != tt.want {
+				t.Errorf("RouteQuery(%T) = %v, want %v", tt.query, got, tt.want)
+			}
+		})
 	}
 }

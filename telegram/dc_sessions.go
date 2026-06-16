@@ -83,6 +83,14 @@ func (c *Client) dcRPC(ctx context.Context, dcID int) (*tg.RPCClient, error) {
 	if dcID == homeDC || homeDC == 0 {
 		return c.Raw(), nil
 	}
+	if c.dcAuthManager != nil {
+		c.dcAuthManager.UpdateMainDC(homeDC)
+		if c.dcAuthManager.IsAuthorized(dcID) {
+			if entry, ok := c.dcSessions.get(dcID); ok {
+				return entry.rpc, nil
+			}
+		}
+	}
 
 	if entry, ok := c.dcSessions.get(dcID); ok {
 		return entry.rpc, nil
@@ -158,6 +166,9 @@ func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry
 		DC:       dcID,
 		TestMode: dc.TestMode,
 	}
+	if c.keySet != nil {
+		auth.SetKeySet(c.keySet)
+	}
 	result, err := auth.Create(sessionTp)
 	if err != nil {
 		sessionTp.Close()
@@ -179,23 +190,38 @@ func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry
 	invoker := &dcSessionInvoker{sess: sess, client: c}
 	rpc := tg.NewRPCClient(invoker)
 
-	exportResult, err := c.Raw().AuthExportAuthorization(ctx, &tg.AuthExportAuthorizationRequest{
-		DCID: int32(dcID),
-	})
-	if err != nil {
-		sess.Stop()
-		sessionTp.Close()
-		return nil, fmt.Errorf("download: export auth for DC %d: %w", dcID, err)
-	}
-
-	_, err = rpc.AuthImportAuthorization(ctx, &tg.AuthImportAuthorizationRequest{
-		ID:    exportResult.ID,
-		Bytes: exportResult.Bytes,
-	})
-	if err != nil {
-		sess.Stop()
-		sessionTp.Close()
-		return nil, fmt.Errorf("download: import auth on DC %d: %w", dcID, err)
+	if c.dcAuthManager != nil {
+		c.dcAuthManager.SetImporter(dcID, func(ctx context.Context, id int64, b []byte) error {
+			_, err := rpc.AuthImportAuthorization(ctx, &tg.AuthImportAuthorizationRequest{
+				ID:    id,
+				Bytes: b,
+			})
+			return err
+		})
+		defer c.dcAuthManager.SetImporter(dcID, nil)
+		if err := c.dcAuthManager.DCLoop(ctx, dcID); err != nil {
+			sess.Stop()
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: auth transfer for DC %d: %w", dcID, err)
+		}
+	} else {
+		exportResult, err := c.Raw().AuthExportAuthorization(ctx, &tg.AuthExportAuthorizationRequest{
+			DCID: int32(dcID),
+		})
+		if err != nil {
+			sess.Stop()
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: export auth for DC %d: %w", dcID, err)
+		}
+		_, err = rpc.AuthImportAuthorization(ctx, &tg.AuthImportAuthorizationRequest{
+			ID:    exportResult.ID,
+			Bytes: exportResult.Bytes,
+		})
+		if err != nil {
+			sess.Stop()
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: import auth on DC %d: %w", dcID, err)
+		}
 	}
 
 	c.Log.Infof("Auth transfer complete for DC %d", dcID)

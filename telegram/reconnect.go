@@ -55,6 +55,89 @@ func (c backoffConfig) delay(attempt int) time.Duration {
 	return time.Duration(delay)
 }
 
+// PerDCBackoff manages independent backoff per DC.
+// Ported from td/td/telegram/net/ConnectionCreator.h:229-232 (ClientInfo::Backoff).
+type PerDCBackoff struct {
+	backoffs  map[int]*backoffState
+	baseDelay time.Duration
+	maxDelay  time.Duration
+	mu        sync.Mutex
+}
+
+type backoffState struct {
+	currentDelay time.Duration
+	lastFailure  time.Time
+	lastSuccess  time.Time
+}
+
+// NewPerDCBackoff creates a new per-DC backoff manager.
+func NewPerDCBackoff(baseDelay, maxDelay time.Duration) *PerDCBackoff {
+	return &PerDCBackoff{
+		backoffs:  make(map[int]*backoffState),
+		baseDelay: baseDelay,
+		maxDelay:  maxDelay,
+	}
+}
+
+// RecordFailure increases backoff for a DC.
+func (b *PerDCBackoff) RecordFailure(dcID int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	bs, ok := b.backoffs[dcID]
+	if !ok {
+		bs = &backoffState{currentDelay: b.baseDelay}
+		b.backoffs[dcID] = bs
+	}
+	bs.currentDelay = bs.currentDelay * 2
+	if bs.currentDelay > b.maxDelay {
+		bs.currentDelay = b.maxDelay
+	}
+	bs.lastFailure = time.Now()
+}
+
+// RecordSuccess resets backoff for a DC.
+func (b *PerDCBackoff) RecordSuccess(dcID int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	bs, ok := b.backoffs[dcID]
+	if !ok {
+		bs = &backoffState{currentDelay: b.baseDelay}
+		b.backoffs[dcID] = bs
+	}
+	bs.currentDelay = b.baseDelay
+	bs.lastSuccess = time.Now()
+	bs.lastFailure = time.Time{} // clear failure timestamp
+}
+
+// GetDelay returns the current backoff delay for a DC.
+func (b *PerDCBackoff) GetDelay(dcID int) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	bs, ok := b.backoffs[dcID]
+	if !ok {
+		return b.baseDelay
+	}
+	return bs.currentDelay
+}
+
+// ShouldRetry reports whether enough time has passed since the last failure.
+func (b *PerDCBackoff) ShouldRetry(dcID int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	bs, ok := b.backoffs[dcID]
+	if !ok {
+		return true
+	}
+	return time.Since(bs.lastFailure) >= bs.currentDelay
+}
+
+// Cleanup removes all backoff states.
+func (b *PerDCBackoff) Cleanup() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.backoffs = make(map[int]*backoffState)
+}
+
 type reconnectManager struct {
 	client   *Client
 	cfg      backoffConfig

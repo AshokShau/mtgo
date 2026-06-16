@@ -377,6 +377,23 @@ type Config struct {
 	// Defaults to 30 seconds.
 	HealthPongTimeout time.Duration
 
+	// PFS enables Perfect Forward Secrecy mode where temporary auth keys
+	// are used for message encryption instead of the permanent key. Temp
+	// keys are generated via DH exchange and bound to the permanent key.
+	// When false (default), the permanent auth key is used directly.
+	// Ported from td/td/telegram/net/Session.cpp:1488-1498 (auth_loop PFS).
+	PFS bool
+	// ConnPoolTTL is the time-to-live for cached warm connections in the
+	// connection pool. Connections cached within this window are reused
+	// on reconnect instead of dialing fresh. Defaults to 10 seconds.
+	// Ported from td/td/telegram/net/ConnectionCreator.cpp (READY_CONNECTIONS_TIMEOUT).
+	ConnPoolTTL time.Duration
+	// EndpointCoolDown is the time to wait before retrying a failed DC
+	// endpoint. Failed endpoints are skipped until the cool-down expires.
+	// Defaults to 16 seconds.
+	// Ported from td/td/telegram/net/ConnectionCreator.cpp (MAX_BACKOFF desktop).
+	EndpointCoolDown time.Duration
+
 	// UpdateQueueSize is the buffered channel capacity for incoming updates.
 	// Larger values absorb bursts but increase memory usage. Defaults to 1024.
 	UpdateQueueSize int
@@ -390,6 +407,56 @@ type Config struct {
 	// UpdateRecoveryEnabled restores updates that may have been lost during
 	// a reconnection by fetching missed events from the server. Defaults to true.
 	UpdateRecoveryEnabled bool
+
+	// ---- Production Hardening (003-production-hardening) ----
+	// All fields below are opt-in: zero-value = current behavior (Constitution
+	// Principle IV). Enable them for high-throughput production deployments.
+
+	// InboundQueueDepth enables the bounded inbound update dispatch queue.
+	// When > 0, received updates are dispatched concurrently by a worker pool
+	// instead of synchronously inline, with this many updates buffered at most.
+	// When 0 (default), dispatch stays synchronous (current behavior).
+	InboundQueueDepth int
+	// InboundQueueWorkers sets the number of concurrent dispatch workers. When
+	// 0 and InboundQueueDepth > 0, defaults to runtime.NumCPU(). Updates with
+	// the same routing key (chat/channel) are dispatched to the same worker to
+	// preserve ordering; updates across keys dispatch concurrently.
+	InboundQueueWorkers int
+	// InboundStallBudget is the maximum time the producer blocks when the
+	// inbound queue is full before applying the overflow policy (shed the
+	// lowest-priority update and trigger getDifference recovery). When 0 and
+	// InboundQueueDepth > 0, defaults to 500ms.
+	InboundStallBudget time.Duration
+
+	// MaxInFlightRPCs enables overload-controlled RPC admission. When > 0, RPCs
+	// are admitted through a semaphore: high-priority RPCs wait up to
+	// AdmissionDeadline for a slot; low-priority RPCs fast-fail immediately
+	// when at capacity (returning ErrOverload). When 0 (default), all RPCs are
+	// admitted unconditionally (current behavior).
+	MaxInFlightRPCs int
+	// AdmissionDeadline bounds the wait for high-priority RPC admission under
+	// overload. When 0 and MaxInFlightRPCs > 0, defaults to 5s.
+	AdmissionDeadline time.Duration
+
+	// OutboundBatchEnabled enables outbound container packing: multiple RPCs
+	// queued within a short window are coalesced into a single MTProto
+	// msg_container. When false (default), each RPC is sent as a separate
+	// encrypted message (current behavior).
+	OutboundBatchEnabled bool
+	// OutboundMaxContainerBytes caps the serialized size of a single container.
+	// When 0 and OutboundBatchEnabled is true, defaults to 1 MiB.
+	OutboundMaxContainerBytes int
+	// OutboundCoalesceWindow is the micro-window engaged only when N>1 RPCs
+	// are queued and a send is in flight. Lone/idle RPCs always flush
+	// immediately. When 0 and OutboundBatchEnabled is true, defaults to 1ms.
+	OutboundCoalesceWindow time.Duration
+
+	// RSAKeyRotationInterval enables the PublicRsaKeyWatchdog: a background
+	// loop that fetches refreshed server RSA keys and verifies each against
+	// the bundled trust root before accepting. When > 0, the watchdog runs on
+	// this interval. When 0 (default), the bundled static keys are used
+	// exclusively (current behavior).
+	RSAKeyRotationInterval time.Duration
 }
 
 // DefaultConfig provides production-ready defaults for a new client. Override
