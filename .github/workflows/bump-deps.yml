@@ -1,0 +1,102 @@
+name: Bump Downstream Deps
+
+# When a version tag (v*) is pushed to mtgo, this workflow automatically
+# bumps the mtgo dependency in all downstream repos, runs their tests,
+# and opens a PR for review.
+#
+# Requires a PAT with `repo` scope stored as the MTGO_LABS_PAT secret
+# in this repository (Settings → Secrets and variables → Actions).
+# The default GITHUB_TOKEN cannot push to other repos in the org.
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "mtgo version to bump to (e.g. v0.8.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-deps-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Multi-module repos list every sub-module directory.
+          # Single-module repos use "." for the repo root.
+          - repo: plugins
+            modules: "conversations i18n"
+          - repo: plugins-template
+            modules: "."
+          - repo: middlewares-template
+            modules: "."
+          - repo: middlewares
+            modules: "floodwait ratelimit"
+
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # Strip refs/tags/ prefix if present.
+            echo "version=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout ${{ matrix.repo }}
+        uses: actions/checkout@v6
+        with:
+          repository: mtgo-labs/${{ matrix.repo }}
+          token: ${{ secrets.MTGO_LABS_PAT }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false # multi-module repos break the cache key
+
+      - name: Bump mtgo dependency
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          MODULES: ${{ matrix.modules }}
+        run: |
+          set -euo pipefail
+          for mod in $MODULES; do
+            echo "::group::Updating $mod"
+            (
+              cd "$mod"
+              go get "github.com/mtgo-labs/mtgo@$VERSION"
+              go mod tidy
+              go vet ./...
+              go test ./...
+            )
+            echo "::endgroup::"
+          done
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.MTGO_LABS_PAT }}
+          commit-message: "chore(deps): bump mtgo to ${{ steps.ver.outputs.version }}"
+          branch: deps/mtgo-${{ steps.ver.outputs.version }}
+          title: "chore(deps): bump mtgo to ${{ steps.ver.outputs.version }}"
+          body: |
+            Automated dependency bump triggered by tag `${{ steps.ver.outputs.version }}` in `mtgo-labs/mtgo`.
+
+            Tests passed in CI before this PR was created.
+          labels: dependencies
+          delete-branch: true
