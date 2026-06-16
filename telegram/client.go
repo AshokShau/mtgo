@@ -2053,6 +2053,8 @@ func (c *Client) toUpdate(raw tg.UpdateClass, users map[int64]*types.User, chats
 			}
 		}
 		upd.ShippingQuery.SetBinder(c)
+	case *tg.UpdateBotBusinessConnect:
+		upd.BusinessConnection = types.ParseBusinessConnection(v.Connection, nil)
 	case *tg.UpdateBotChatInviteRequester:
 		upd.ChatJoinRequest = types.ParseChatJoinRequest(v, users, chats)
 		if upd.ChatJoinRequest != nil {
