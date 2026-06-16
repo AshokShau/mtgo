@@ -378,10 +378,6 @@ type Session struct {
 
 	// pending manages all outstanding RPC call lifecycles.
 	pending *PendingManager
-	// containerTracker maps container msg_ids to child query msg_ids.
-	containerTracker *ContainerTracker
-	// floodWaits records delayed queries for observability and tests.
-	floodWaits *FloodWaitQueue
 
 	// sm is the session connection state machine.
 	sm *stateMachine
@@ -431,14 +427,15 @@ type Session struct {
 	// log receives structured log output. When nil, logging is suppressed.
 	log sessionLogger
 
-	// outboundBatcher coalesces outbound RPCs into msg_container messages when
-	// non-nil. When nil, each Send packs a single encrypted message (backward
-	// compat — Constitution Principle IV).
-	outboundBatcher *OutboundBatcher
-
 	consecWriteFailures   int
 	writeBreakerThreshold int
 	writeBreakerOpen      atomic.Bool
+
+	// Production-hardening fields (end of struct to keep hot-path fields in
+	// the first 6 cache lines — only accessed when features are enabled).
+	containerTracker *ContainerTracker
+	floodWaits        *FloodWaitQueue
+	outboundBatcher   *OutboundBatcher
 }
 
 // SetOnPanic sets a callback invoked when a dispatchUpdate goroutine panics.
