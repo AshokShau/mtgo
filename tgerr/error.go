@@ -132,7 +132,13 @@ func AsType(err error, t string) (rpcErr *Error, ok bool) {
 
 // As uses errors.As to extract an *Error from err. It returns the matched Error
 // and true on success, or nil and false otherwise.
+//
+// A type-assertion fast path avoids errors.As reflection overhead for the
+// common case where err is already *Error (the typical RPC error path).
 func As(err error) (rpcErr *Error, ok bool) {
+	if rpcErr, ok = err.(*Error); ok {
+		return rpcErr, true
+	}
 	if errors.As(err, &rpcErr) {
 		return rpcErr, true
 	}

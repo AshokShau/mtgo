@@ -2,85 +2,110 @@ goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/internal/crypto
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkCryptoPack-12          	  998378	      1272 ns/op	     961 B/op	      16 allocs/op
-BenchmarkKDF-12                 	 9314467	       128.2 ns/op	       0 B/op	       0 allocs/op
-BenchmarkIGEEncrypt-12          	 1239166	       951.0 ns/op	    4152 B/op	       4 allocs/op
-BenchmarkIGEDecrypt-12          	 1367538	       874.5 ns/op	    4152 B/op	       4 allocs/op
-BenchmarkSecretEncrypt-12       	  379426	      3432 ns/op	    2783 B/op	      12 allocs/op
-BenchmarkSecretDecrypt-12       	 1570663	       765.0 ns/op	     120 B/op	       4 allocs/op
-BenchmarkSecretKDF-12           	 9643230	       124.6 ns/op	       0 B/op	       0 allocs/op
-BenchmarkValidateGA-12          	 5607674	       207.3 ns/op	     896 B/op	       3 allocs/op
-BenchmarkValidateDHPrime-12     	      12	  97104272 ns/op	  495381 B/op	     916 allocs/op
-BenchmarkKeyFingerprint-12      	 7519348	       165.4 ns/op	       0 B/op	       0 allocs/op
-BenchmarkKeyVisualization-12    	 3486402	       362.1 ns/op	     112 B/op	       2 allocs/op
+BenchmarkCryptoPack-12          	  998347	      1264 ns/op	     961 B/op	      16 allocs/op
+BenchmarkKDF-12                 	 9308768	       128.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIGEEncrypt-12          	 1281648	       912.5 ns/op	    4152 B/op	       4 allocs/op
+BenchmarkIGEDecrypt-12          	 1401454	       858.0 ns/op	    4152 B/op	       4 allocs/op
+BenchmarkSecretEncrypt-12       	  385990	      3349 ns/op	    2786 B/op	      12 allocs/op
+BenchmarkSecretDecrypt-12       	  843284	      1264 ns/op	     120 B/op	       4 allocs/op
+BenchmarkSecretKDF-12           	 9494137	       126.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkValidateGA-12          	 5437261	       208.7 ns/op	     896 B/op	       3 allocs/op
+BenchmarkValidateDHPrime-12     	      10	 100853846 ns/op	  495428 B/op	     916 allocs/op
+BenchmarkKeyFingerprint-12      	 7661361	       160.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkKeyVisualization-12    	 3460504	       364.2 ns/op	     112 B/op	       2 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/internal/crypto	14.191s
+ok  	github.com/mtgo-labs/mtgo/internal/crypto	13.767s
 goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/tg
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkEncodePong-12              	14111360	        83.54 ns/op	     136 B/op	       5 allocs/op
-BenchmarkEncodeConfig-12            	 2071106	       578.9 ns/op	     624 B/op	      36 allocs/op
-BenchmarkDecodeConfig-12            	 8600736	       137.0 ns/op	     392 B/op	       3 allocs/op
-BenchmarkEncodeMsgsAck-12           	 4206802	       280.9 ns/op	     336 B/op	      16 allocs/op
-BenchmarkEncodeMTProtoMessage-12    	 7242741	       166.2 ns/op	     264 B/op	      10 allocs/op
-BenchmarkDecodeMTProtoMessage-12    	17198922	        69.38 ns/op	      48 B/op	       2 allocs/op
-BenchmarkGzipPackedEncode-12        	 5470456	       218.7 ns/op	     170 B/op	       5 allocs/op
-BenchmarkNewReaderRelease-12        	100000000	        11.47 ns/op	       0 B/op	       0 allocs/op
-BenchmarkEncodeTLObject-12          	10589193	       101.5 ns/op	     136 B/op	       5 allocs/op
-BenchmarkReadTLObject-12            	40218134	        30.97 ns/op	      16 B/op	       1 allocs/op
+BenchmarkEncodePong-12              	14304835	        83.31 ns/op	     136 B/op	       5 allocs/op
+BenchmarkEncodeConfig-12            	 2027294	       588.2 ns/op	     624 B/op	      36 allocs/op
+BenchmarkDecodeConfig-12            	 8818845	       126.3 ns/op	     392 B/op	       3 allocs/op
+BenchmarkEncodeMsgsAck-12           	 4213024	       283.1 ns/op	     336 B/op	      16 allocs/op
+BenchmarkEncodeMTProtoMessage-12    	 7152254	       167.7 ns/op	     264 B/op	      10 allocs/op
+BenchmarkDecodeMTProtoMessage-12    	18578142	        68.76 ns/op	      48 B/op	       2 allocs/op
+BenchmarkGzipPackedEncode-12        	 5348094	       216.2 ns/op	     163 B/op	       5 allocs/op
+BenchmarkNewReaderRelease-12        	100000000	        10.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEncodeTLObject-12          	14527555	        83.09 ns/op	     136 B/op	       5 allocs/op
+BenchmarkReadTLObject-12            	41441888	        29.49 ns/op	      16 B/op	       1 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/tg	11.805s
+ok  	github.com/mtgo-labs/mtgo/tg	11.839s
 goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/tgerr
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkIs-12            	25466169	        52.48 ns/op	       8 B/op	       1 allocs/op
-BenchmarkIsNotMatch-12    	24708530	        48.70 ns/op	       8 B/op	       1 allocs/op
-BenchmarkIsNil-12         	86556392	        13.01 ns/op	       8 B/op	       1 allocs/op
-BenchmarkIsVariadic-12    	25629616	        45.95 ns/op	       8 B/op	       1 allocs/op
-BenchmarkNew-12           	18722356	        66.49 ns/op	      64 B/op	       2 allocs/op
-BenchmarkAs-12            	17657772	        66.91 ns/op	       8 B/op	       1 allocs/op
+BenchmarkIs-12            	97139886	        12.35 ns/op	       8 B/op	       1 allocs/op
+BenchmarkIsNotMatch-12    	99511704	        12.53 ns/op	       8 B/op	       1 allocs/op
+BenchmarkIsNil-12         	87483896	        13.40 ns/op	       8 B/op	       1 allocs/op
+BenchmarkIsVariadic-12    	85521397	        13.66 ns/op	       8 B/op	       1 allocs/op
+BenchmarkNew-12           	17830741	        65.30 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAs-12            	18651259	        65.74 ns/op	       8 B/op	       1 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/tgerr	7.274s
+ok  	github.com/mtgo-labs/mtgo/tgerr	7.182s
 goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/internal/transport
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkAbridgedEncodeLength-12         	897203518	         1.343 ns/op	       0 B/op	       0 allocs/op
-BenchmarkIntermediateEncodeLength-12     	1000000000	         1.118 ns/op	       0 B/op	       0 allocs/op
-BenchmarkDetectTransportError4Byte-12    	1000000000	         0.6263 ns/op	       0 B/op	       0 allocs/op
-BenchmarkDetectTransportErrorLarge-12    	1000000000	         0.4020 ns/op	       0 B/op	       0 allocs/op
-BenchmarkIsQuickAckToken-12              	1000000000	         0.4135 ns/op	       0 B/op	       0 allocs/op
-BenchmarkTrimPaddedIntermediate-12       	491719644	         2.439 ns/op	       0 B/op	       0 allocs/op
-BenchmarkIsForbiddenNonce-12             	282540861	         4.343 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAbridgedEncodeLength-12         	899735283	         1.332 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIntermediateEncodeLength-12     	1000000000	         0.9714 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDetectTransportError4Byte-12    	1000000000	         0.5815 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDetectTransportErrorLarge-12    	1000000000	         0.3823 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIsQuickAckToken-12              	1000000000	         0.3993 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTrimPaddedIntermediate-12       	503747126	         2.380 ns/op	       0 B/op	       0 allocs/op
+BenchmarkIsForbiddenNonce-12             	282385125	         4.174 ns/op	       0 B/op	       0 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/internal/transport	6.199s
+ok  	github.com/mtgo-labs/mtgo/internal/transport	5.916s
 goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/telegram/fileid
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkEncodeFileID-12             	 6137283	       194.7 ns/op	     224 B/op	       4 allocs/op
-BenchmarkDecodeFileID-12             	 7465329	       162.4 ns/op	     112 B/op	       3 allocs/op
-BenchmarkEncodeDecodeRoundTrip-12    	 4430631	       273.3 ns/op	     251 B/op	       6 allocs/op
+BenchmarkEncodeFileID-12             	 6578258	       180.2 ns/op	     224 B/op	       4 allocs/op
+BenchmarkDecodeFileID-12             	 7154678	       159.9 ns/op	     112 B/op	       3 allocs/op
+BenchmarkEncodeDecodeRoundTrip-12    	 4540496	       263.6 ns/op	     251 B/op	       6 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/telegram/fileid	3.621s
+ok  	github.com/mtgo-labs/mtgo/telegram/fileid	3.530s
 goos: linux
 goarch: amd64
 pkg: github.com/mtgo-labs/mtgo/internal/session
 cpu: AMD Ryzen 5 7600X 6-Core Processor             
-BenchmarkContainerTrackerTrackContainer-12    	 7107386	       211.8 ns/op	      97 B/op	       1 allocs/op
-BenchmarkContainerTrackerAckChild-12          	170325044	         6.956 ns/op	       0 B/op	       0 allocs/op
-BenchmarkPendingRegisterResolve-12            	13443970	        92.07 ns/op	     208 B/op	       2 allocs/op
-BenchmarkPendingRegisterCancel-12             	16787968	        72.84 ns/op	     208 B/op	       2 allocs/op
-BenchmarkSaltManagerLoad-12                   	254172069	         4.637 ns/op	       0 B/op	       0 allocs/op
-BenchmarkMsgFactoryAllocateMsgID-12           	33989173	        35.09 ns/op	       0 B/op	       0 allocs/op
-BenchmarkMsgFactoryAllocateSeqNo-12           	793927849	         1.479 ns/op	       0 B/op	       0 allocs/op
-BenchmarkFloodWaitQueueDelay-12               	 8253724	       131.2 ns/op	     284 B/op	       0 allocs/op
-BenchmarkMsgIDValidatorCheck-12               	844857547	         1.409 ns/op	       0 B/op	       0 allocs/op
-BenchmarkDCOptionPoolFindBest-12              	13267482	        89.25 ns/op	     288 B/op	       2 allocs/op
-BenchmarkSessionRPCResultRouting/constructor_fast_path_raw_result-12         	 9533797	       119.5 ns/op	     232 B/op	       3 allocs/op
-BenchmarkSessionRPCResultRouting/constructor_fast_path_decoded_result-12     	 8069728	       148.8 ns/op	     224 B/op	       3 allocs/op
-BenchmarkSessionRPCResultRouting/full_TL_decode_rpc_result_wrapper-12        	 7208536	       168.5 ns/op	     248 B/op	       4 allocs/op
+BenchmarkContainerTrackerTrackContainer-12    	 7433077	       220.8 ns/op	     114 B/op	       1 allocs/op
+BenchmarkContainerTrackerAckChild-12          	175899208	         6.861 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPendingRegisterResolve-12            	13854609	        86.32 ns/op	     208 B/op	       2 allocs/op
+BenchmarkPendingRegisterCancel-12             	17539448	        70.52 ns/op	     208 B/op	       2 allocs/op
+BenchmarkSaltManagerLoad-12                   	259885806	         4.622 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMsgFactoryAllocateMsgID-12           	34533012	        35.09 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMsgFactoryAllocateSeqNo-12           	790235559	         1.488 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFloodWaitQueueDelay-12               	 8142360	       140.5 ns/op	     288 B/op	       0 allocs/op
+BenchmarkMsgIDValidatorCheck-12               	814604346	         1.457 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDCOptionPoolFindBest-12              	13237690	        88.47 ns/op	     288 B/op	       2 allocs/op
+BenchmarkSessionRPCResultRouting/constructor_fast_path_raw_result-12         	10066284	       122.4 ns/op	     232 B/op	       3 allocs/op
+BenchmarkSessionRPCResultRouting/constructor_fast_path_decoded_result-12     	 6994224	       152.6 ns/op	     224 B/op	       3 allocs/op
+BenchmarkSessionRPCResultRouting/full_TL_decode_rpc_result_wrapper-12        	 7183455	       172.3 ns/op	     248 B/op	       4 allocs/op
 PASS
-ok  	github.com/mtgo-labs/mtgo/internal/session	17.406s
+ok  	github.com/mtgo-labs/mtgo/internal/session	17.488s
+goos: linux
+goarch: amd64
+pkg: github.com/mtgo-labs/mtgo/telegram/types
+cpu: AMD Ryzen 5 7600X 6-Core Processor             
+BenchmarkParseUser-12                     	19981600	        57.34 ns/op	     416 B/op	       1 allocs/op
+BenchmarkParseChatFromChat-12             	 9869062	       123.0 ns/op	    1168 B/op	       2 allocs/op
+BenchmarkParseMessageEntityBold-12        	49765261	        23.58 ns/op	     128 B/op	       1 allocs/op
+BenchmarkParseMessageEntityTextLink-12    	49617439	        23.77 ns/op	     128 B/op	       1 allocs/op
+BenchmarkParseMessageEntities-12          	 7467421	       162.9 ns/op	     688 B/op	       6 allocs/op
+BenchmarkParseMessage-12                  	 2987106	       404.8 ns/op	    3632 B/op	       6 allocs/op
+BenchmarkPeerMapResolve-12                	662418945	         1.805 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mtgo-labs/mtgo/telegram/types	8.339s
+goos: linux
+goarch: amd64
+pkg: github.com/mtgo-labs/mtgo/telegram/parser
+cpu: AMD Ryzen 5 7600X 6-Core Processor             
+BenchmarkParseMarkdownSimple-12     	  870110	      1364 ns/op	    1164 B/op	      27 allocs/op
+BenchmarkParseMarkdownComplex-12    	  290767	      3759 ns/op	    4058 B/op	      51 allocs/op
+BenchmarkParseHTMLSimple-12         	 1000000	      1067 ns/op	     840 B/op	      18 allocs/op
+BenchmarkParseHTMLComplex-12        	  296700	      4119 ns/op	    3363 B/op	      47 allocs/op
+BenchmarkParseHTMLNested-12         	  408558	      2887 ns/op	    2197 B/op	      34 allocs/op
+BenchmarkParsePlain-12              	740819143	         1.602 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mtgo-labs/mtgo/telegram/parser	6.941s
