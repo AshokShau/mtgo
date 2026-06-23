@@ -93,6 +93,9 @@ const (
 // Fields that are left at their zero value fall back to the sensible defaults
 // defined in DefaultConfig.
 //
+// Note: this is the client-side options struct, unrelated to tg.Config which is
+// the server-returned configuration obtained via help.getConfig.
+//
 // Example:
 //
 //	cfg := telegram.Config{
