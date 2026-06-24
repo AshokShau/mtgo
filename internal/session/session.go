@@ -388,6 +388,8 @@ type Session struct {
 
 	// transport is the underlying network transport for sending/receiving data.
 	transport Transport
+	// pfs manages the PFS temporary auth key lifecycle. nil when PFS is disabled.
+	pfs *TempKeyManager
 	// writeMux serializes writes to the transport. Every outbound message
 	// (RPC, service, ack, ping) acquires this mutex, writes directly, and
 	// releases it. No goroutine hop, no channel, no silent drops.
@@ -647,6 +649,30 @@ func (s *Session) SetAuthKey(key []byte) {
 	} else {
 		s.authKeyID = nil
 	}
+	s.mu.Unlock()
+}
+
+// SwapAuthKey atomically replaces the active auth key. Used by PFS to switch
+// from the permanent key to the temporary key after binding succeeds.
+// The caller must ensure no in-flight messages depend on the old key.
+func (s *Session) SwapAuthKey(newKey []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authKey = newKey
+	s.authKeyID = computeAuthKeyID(newKey)
+}
+
+// PFS returns the PFS temp key manager, or nil if PFS is not enabled.
+func (s *Session) PFS() *TempKeyManager {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pfs
+}
+
+// SetPFS attaches a PFS temp key manager to this session.
+func (s *Session) SetPFS(mgr *TempKeyManager) {
+	s.mu.Lock()
+	s.pfs = mgr
 	s.mu.Unlock()
 }
 
@@ -2065,6 +2091,13 @@ func NewTempKeyManager(dcID int, testMode bool, permKey []byte, enabled bool, pe
 // IsEnabled reports whether PFS mode is active.
 func (m *TempKeyManager) IsEnabled() bool {
 	return m.enabled
+}
+
+// PermKey returns the permanent auth key. Used for fallback when bind fails.
+func (m *TempKeyManager) PermKey() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.permKey
 }
 
 // NeedsInitConnection reports whether the caller must call initConnection

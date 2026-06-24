@@ -985,7 +985,15 @@ func (c *Client) connectTransport(timeout time.Duration) error {
 		return err
 	}
 
+	if err := c.performPFS(sess, st, dc, sessionTp); err != nil {
+		return err
+	}
+
 	if err := c.startSession(sess, sessionTp, timeout); err != nil {
+		return err
+	}
+
+	if err := c.bindPFS(sess); err != nil {
 		return err
 	}
 
@@ -1227,6 +1235,80 @@ func (c *Client) performDHExchange(sess *session.Session, st storage.Storage, dc
 		c.Log.Warnf("save test mode: %v", err)
 	}
 	c.Log.Debug("DH exchange complete; auth_key=", len(result.AuthKey), " bytes")
+	return nil
+}
+
+// performPFS generates a temporary auth key for Perfect Forward Secrecy if
+// Config.PFS is enabled. The temp key is generated via an unencrypted DH
+// exchange on the same raw transport, then set as the session's active auth
+// key. The actual binding (auth.bindTempAuthKey) happens in bindPFS after the
+// encrypted session starts.
+//
+// If temp key generation fails, the session continues with the permanent key
+// (PFS is opt-in, not mandatory).
+func (c *Client) performPFS(sess *session.Session, st storage.Storage, dc session.DataCenter, sessionTp *sessionTransport) error {
+	if !c.config().PFS {
+		return nil
+	}
+
+	permKey, _ := st.AuthKey()
+	if len(permKey) == 0 {
+		return nil
+	}
+
+	c.Log.Debug("PFS: generating temporary auth key")
+
+	mgr := session.NewTempKeyManager(dc.ID, dc.TestMode, permKey, true, false, st)
+	if err := mgr.Generate(sessionTp); err != nil {
+		c.Log.Warnf("PFS: temp key generation failed, continuing with perm key: %v", err)
+		return nil // non-fatal
+	}
+
+	tempKey, _ := mgr.GetKey()
+	sess.SwapAuthKey(tempKey)
+	sess.SetPFS(mgr)
+
+	c.Log.Debug("PFS: temp key generated, session swapped to temp key")
+	return nil
+}
+
+// bindPFS sends auth.bindTempAuthKey to bind the temp key to the permanent
+// key. This must be called after the encrypted session has started (the bind
+// request goes through the encrypted channel using the temp key).
+//
+// On success, sends initConnection to rewrite client info as required by the
+// PFS spec. On failure, falls back to the permanent key.
+func (c *Client) bindPFS(sess *session.Session) error {
+	pfs := sess.PFS()
+	if pfs == nil {
+		return nil
+	}
+
+	c.Log.Debug("PFS: binding temp key to permanent key")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := pfs.Bind(ctx, sess.SessionID(), func(ctx context.Context, query tg.TLObject, retries int, timeout time.Duration) (tg.TLObject, error) {
+		return sess.Invoke(ctx, query, retries, timeout)
+	})
+	if err != nil {
+		c.Log.Warnf("PFS: bind failed, falling back to permanent key: %v", err)
+		sess.SwapAuthKey(pfs.PermKey())
+		sess.SetPFS(nil)
+		return nil // non-fatal
+	}
+
+	if pfs.NeedsInitConnection() {
+		c.Log.Debug("PFS: rewriting client info via initConnection")
+		rpc := c.Raw()
+		_, icErr := rpc.HelpGetConfig(ctx)
+		if icErr != nil {
+			c.Log.Warnf("PFS: initConnection (help.getConfig) failed: %v", icErr)
+		}
+	}
+
+	c.Log.Info("PFS: temp key bound successfully")
 	return nil
 }
 
