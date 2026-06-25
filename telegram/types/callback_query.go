@@ -57,6 +57,11 @@ type InlineQuery struct {
 	Query string
 	// Offset is the pagination offset for the next batch of results.
 	Offset string
+	// Geo is the user's geolocation attached to the query, if shared.
+	Geo tg.GeoPointClass
+	// PeerType describes the chat the inline query originated from; maps to the
+	// Bot API inline-query chat_type.
+	PeerType tg.InlineQueryPeerTypeClass
 	binder Binder
 }
 
@@ -229,10 +234,12 @@ func ParseInlineQuery(raw tg.UpdateClass) *InlineQuery {
 	}
 	if r, ok := raw.(*tg.UpdateBotInlineQuery); ok {
 		return &InlineQuery{
-			ID:     r.QueryID,
-			UserID: r.UserID,
-			Query:  r.Query,
-			Offset: r.Offset,
+			ID:       r.QueryID,
+			UserID:   r.UserID,
+			Query:    r.Query,
+			Offset:   r.Offset,
+			Geo:      r.Geo,
+			PeerType: r.PeerType,
 		}
 	}
 	return nil
