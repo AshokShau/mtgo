@@ -93,29 +93,33 @@ func (s *testServer) handleConn(conn net.Conn) {
 			return
 		}
 
+		salt := int64(binary.LittleEndian.Uint64(decrypted[0:8]))
+		sessionID := decrypted[8:16]
+		respMsgID := (time.Now().Unix() << 32) | 1
+		respSeqNo := uint32(0)
+		origMsgID := int64(binary.LittleEndian.Uint64(decrypted[16:24]))
+
+		var body tg.TLObject
 		if constructorID == tg.PingTypeID {
-			salt := int64(binary.LittleEndian.Uint64(decrypted[0:8]))
-			sessionID := decrypted[8:16]
-
-			respMsgID := (time.Now().Unix() << 32) | 1
-			respSeqNo := uint32(0)
-
-			origMsgID := int64(binary.LittleEndian.Uint64(decrypted[16:24]))
-			pong := &tg.Pong{MsgID: origMsgID, PingID: pingID}
-			respMsg := &tg.MTProtoMessage{MsgID: respMsgID, SeqNo: respSeqNo, Body: pong}
-
-			encrypted, err := crypto.Pack(respMsg, salt, sessionID, s.authKey, authKeyID)
-			if err != nil {
-				continue
-			}
-
-			var resp bytes.Buffer
-			binary.Write(&resp, binary.LittleEndian, uint32(len(encrypted)))
-			resp.Write(encrypted)
-
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			conn.Write(resp.Bytes())
+			body = &tg.Pong{MsgID: origMsgID, PingID: pingID}
+		} else {
+			// Respond to any non-Ping request (RPC calls, InvokeWithLayer, etc.)
+			// with an RPCError so the client doesn't hang waiting for a response.
+			body = &tg.RPCResult{ReqMsgID: origMsgID, Result: &tg.RPCError{ErrorCode: 500, ErrorMessage: "MOCK_SERVER"}}
 		}
+
+		respMsg := &tg.MTProtoMessage{MsgID: respMsgID, SeqNo: respSeqNo, Body: body}
+		encrypted, err := crypto.Pack(respMsg, salt, sessionID, s.authKey, authKeyID)
+		if err != nil {
+			continue
+		}
+
+		var resp bytes.Buffer
+		binary.Write(&resp, binary.LittleEndian, uint32(len(encrypted)))
+		resp.Write(encrypted)
+
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		conn.Write(resp.Bytes())
 	}
 }
 
