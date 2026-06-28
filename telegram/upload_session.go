@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,50 +27,67 @@ type sideSession struct {
 const uploadPartTimeout = 2 * time.Minute
 
 // uploadPoolSize is the number of dedicated TCP connections for upload traffic.
-// Multiple connections avoid single-connection write serialization when 8+
-// workers compete for one transport. Mirrors mtcute (4-8) and gogram (up to 16).
-const uploadPoolSize = 4
+// Multiple connections avoid single-connection write serialization when
+// default upload workers compete for one transport.
+const uploadPoolSize = defaultTransferWorkers
 
 // uploadPoolInvoker round-robins RPC calls across multiple upload sessions.
 // If a session dies, it is skipped; the client eventually recreates it on the
 // next uploadRPC() call.
 type uploadPoolInvoker struct {
 	client   *Client
-	invokers []tg.Invoker
+	sessions []*sideSession
 	idx      atomic.Uint64
 }
 
 func (p *uploadPoolInvoker) RPCInvoke(ctx context.Context, input tg.TLObject, decode func(*tg.Reader) (tg.TLObject, error)) (tg.TLObject, error) {
-	n := uint64(len(p.invokers))
+	n := uint64(len(p.sessions))
+	var lastErr error
 	for i := uint64(0); i < n; i++ {
 		idx := p.idx.Add(1) % n
-		inv := p.invokers[idx]
-		result, err := inv.RPCInvoke(ctx, input, decode)
+		ss := p.sessions[idx]
+		if ss == nil || ss.dead.Load() {
+			continue
+		}
+		result, err := ss.invoker.RPCInvoke(ctx, input, decode)
 		if err == nil {
 			return result, nil
 		}
-		// On session-closed, try the next invoker in the pool.
-		if isSessionClosedErr(err) && i < n-1 {
+		lastErr = err
+		if isSessionClosedErr(err) {
+			ss.dead.Store(true)
 			continue
 		}
 		return nil, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, fmt.Errorf("upload pool: all sessions exhausted")
 }
 
 func (p *uploadPoolInvoker) RPCInvokeRaw(ctx context.Context, input tg.TLObject) ([]byte, error) {
-	n := uint64(len(p.invokers))
+	n := uint64(len(p.sessions))
+	var lastErr error
 	for i := uint64(0); i < n; i++ {
 		idx := p.idx.Add(1) % n
-		inv := p.invokers[idx]
-		result, err := inv.RPCInvokeRaw(ctx, input)
+		ss := p.sessions[idx]
+		if ss == nil || ss.dead.Load() {
+			continue
+		}
+		result, err := ss.invoker.RPCInvokeRaw(ctx, input)
 		if err == nil {
 			return result, nil
 		}
-		if isSessionClosedErr(err) && i < n-1 {
+		lastErr = err
+		if isSessionClosedErr(err) {
+			ss.dead.Store(true)
 			continue
 		}
 		return nil, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, fmt.Errorf("upload pool: all sessions exhausted")
 }
@@ -96,11 +114,7 @@ func (c *Client) uploadRPC() *tg.RPCClient {
 	if err != nil || len(pool) == 0 {
 		return c.Raw()
 	}
-	invokers := make([]tg.Invoker, len(pool))
-	for i, ss := range pool {
-		invokers[i] = ss.invoker
-	}
-	return tg.NewRPCClient(&uploadPoolInvoker{client: c, invokers: invokers})
+	return tg.NewRPCClient(&uploadPoolInvoker{client: c, sessions: pool})
 }
 
 // getUploadPool returns the lazily-created upload session pool, creating it
@@ -134,16 +148,7 @@ func (c *Client) getUploadPool() ([]*sideSession, error) {
 		}
 	}
 
-	// Create fresh pool.
-	sessions := make([]*sideSession, 0, uploadPoolSize)
-	for i := 0; i < uploadPoolSize; i++ {
-		ss, err := c.createUploadSession()
-		if err != nil {
-			c.Log.Warnf("upload session %d/%d failed: %v (continuing with %d sessions)", i+1, uploadPoolSize, err, len(sessions))
-			break
-		}
-		sessions = append(sessions, ss)
-	}
+	sessions := c.createUploadSessions(uploadPoolSize)
 
 	if len(sessions) == 0 {
 		return nil, fmt.Errorf("upload pool: no sessions created")
@@ -152,6 +157,46 @@ func (c *Client) getUploadPool() ([]*sideSession, error) {
 	c.uploadPool = sessions
 	c.Log.Infof("upload pool ready: %d sessions on separate connections", len(sessions))
 	return sessions, nil
+}
+
+func (c *Client) createUploadSessions(size int) []*sideSession {
+	type result struct {
+		idx int
+		ss  *sideSession
+		err error
+	}
+
+	results := make(chan result, size)
+	var wg sync.WaitGroup
+	for i := 0; i < size; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ss, err := c.createUploadSession()
+			results <- result{idx: idx, ss: ss, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	sessions := make([]*sideSession, size)
+	created := 0
+	for r := range results {
+		if r.err != nil {
+			c.Log.Warnf("upload session %d/%d failed: %v (continuing with %d sessions)", r.idx+1, size, r.err, created)
+			continue
+		}
+		sessions[r.idx] = r.ss
+		created++
+	}
+
+	compact := sessions[:0]
+	for _, ss := range sessions {
+		if ss != nil {
+			compact = append(compact, ss)
+		}
+	}
+	return compact
 }
 
 func hasDeadSession(pool []*sideSession) bool {
@@ -233,11 +278,14 @@ func (c *Client) createUploadSession() (*sideSession, error) {
 
 	// Wrap with a resilientInvoker that marks the session dead on connection errors.
 	invoker := &dcSessionInvoker{sess: sess, client: c}
-	return &sideSession{
+	resilient := &resilientUploadInvoker{inner: invoker, session: sess}
+	ss := &sideSession{
 		sess:    sess,
 		closer:  sessionTp,
-		invoker: &resilientUploadInvoker{inner: invoker, session: sess, ss: nil},
-	}, nil
+		invoker: resilient,
+	}
+	resilient.ss = ss
+	return ss, nil
 }
 
 // resilientUploadInvoker wraps dcSessionInvoker and marks the sideSession as
@@ -251,9 +299,7 @@ type resilientUploadInvoker struct {
 func (r *resilientUploadInvoker) RPCInvoke(ctx context.Context, input tg.TLObject, decode func(*tg.Reader) (tg.TLObject, error)) (tg.TLObject, error) {
 	result, err := r.inner.RPCInvoke(ctx, input, decode)
 	if err != nil && isSessionClosedErr(err) {
-		// Mark this session as dead so the pool recreates it.
-		// We can't reference ss directly (circular), so we use a sentinel.
-		r.session.Stop()
+		r.markDead()
 	}
 	return result, err
 }
@@ -261,9 +307,18 @@ func (r *resilientUploadInvoker) RPCInvoke(ctx context.Context, input tg.TLObjec
 func (r *resilientUploadInvoker) RPCInvokeRaw(ctx context.Context, input tg.TLObject) ([]byte, error) {
 	result, err := r.inner.RPCInvokeRaw(ctx, input)
 	if err != nil && isSessionClosedErr(err) {
-		r.session.Stop()
+		r.markDead()
 	}
 	return result, err
+}
+
+func (r *resilientUploadInvoker) markDead() {
+	if r.ss != nil {
+		r.ss.dead.Store(true)
+	}
+	if r.session != nil {
+		r.session.Stop()
+	}
 }
 
 // stopUploadSession tears down all upload sessions. Called during cleanup.

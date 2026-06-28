@@ -280,8 +280,8 @@ type Download struct {
 	ChunkSize int32
 
 	// Workers controls the number of concurrent range requests used when the
-	// destination supports random writes. Values greater than 8 are clamped to
-	// 8. A value of 0 lets the client choose a sensible default when the size
+	// destination supports random writes. Values greater than 16 are clamped to
+	// 16. A value of 0 lets the client choose a sensible default when the size
 	// and destination support parallel downloads. Set Workers to 1 to force the
 	// serial downloader.
 	Workers int

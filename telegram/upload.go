@@ -165,6 +165,7 @@ func uploadFileStreamRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reade
 	var wg sync.WaitGroup
 	var hasErr atomic.Bool
 	var uploadedBytes atomic.Int64
+	var progressMu sync.Mutex
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -224,12 +225,14 @@ func uploadFileStreamRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reade
 
 				if opts != nil && opts.Progress != nil {
 					done := uploadedBytes.Add(int64(len(job.data)))
+					progressMu.Lock()
 					opts.Progress(params.ProgressInfo{
 						FileName:      fileName,
 						TotalBytes:    0,
 						UploadedBytes: done,
 						IsUpload:      true,
 					})
+					progressMu.Unlock()
 				}
 			}
 		}()
@@ -337,6 +340,7 @@ func uploadFileKnownRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reader
 	var wg sync.WaitGroup
 	var hasErr atomic.Bool
 	var uploadedBytes atomic.Int64
+	var progressMu sync.Mutex
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -393,12 +397,14 @@ func uploadFileKnownRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reader
 
 				if opts != nil && opts.Progress != nil {
 					done := uploadedBytes.Add(int64(len(job.data)))
+					progressMu.Lock()
 					opts.Progress(params.ProgressInfo{
 						FileName:      fileName,
 						TotalBytes:    fileSize,
 						UploadedBytes: done,
 						IsUpload:      true,
 					})
+					progressMu.Unlock()
 				}
 			}
 		}()

@@ -390,8 +390,8 @@ func (m *memoryBuffer) WriteAt(p []byte, off int64) (int, error) {
 	if end > int64(len(m.data)) {
 		return 0, io.ErrShortWrite
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Parallel downloads pre-size m.data and assign each worker a disjoint
+	// byte range, so the copy itself does not need the serial Write lock.
 	copy(m.data[off:end], p)
 	return len(p), nil
 }
