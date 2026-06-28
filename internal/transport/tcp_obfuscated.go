@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 
 	"github.com/mtgo-labs/mtgo/internal/crypto"
 )
@@ -26,10 +27,8 @@ func isForbiddenNonce(nonce []byte) bool {
 		return true
 	}
 	firstInt := binary.LittleEndian.Uint32(nonce[0:4])
-	for _, v := range forbiddenFirstInts {
-		if firstInt == v {
-			return true
-		}
+	if slices.Contains(forbiddenFirstInts, firstInt) {
+		return true
 	}
 	secondInt := binary.LittleEndian.Uint32(nonce[4:8])
 	return secondInt == 0

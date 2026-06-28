@@ -12,7 +12,7 @@ import (
 
 type TCPFull struct {
 	conn    net.Conn
-	seqNo   uint32
+	seqNo   atomic.Uint32
 	readBuf []byte
 }
 
@@ -24,7 +24,7 @@ func NewTCPFull(conn net.Conn) *TCPFull {
 // Connect resets the internal sequence counter. It does not perform any
 // network I/O because the underlying connection is already established.
 func (t *TCPFull) Connect() error {
-	atomic.StoreUint32(&t.seqNo, 0)
+	t.seqNo.Store(0)
 	return nil
 }
 
@@ -39,11 +39,11 @@ func (t *TCPFull) Send(buf *bytes.Buffer) error {
 
 	packet := make([]byte, 4+4+len(data)+4)
 	binary.LittleEndian.PutUint32(packet[0:4], uint32(len(data)+12))
-	binary.LittleEndian.PutUint32(packet[4:8], atomic.LoadUint32(&t.seqNo))
+	binary.LittleEndian.PutUint32(packet[4:8], t.seqNo.Load())
 	copy(packet[8:8+len(data)], data)
 	binary.LittleEndian.PutUint32(packet[8+len(data):], crc32.ChecksumIEEE(packet[:8+len(data)]))
 
-	atomic.AddUint32(&t.seqNo, 1)
+	t.seqNo.Add(1)
 
 	_, err := t.conn.Write(packet)
 	return err

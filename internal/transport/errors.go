@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // MaxPayloadLen is the maximum allowed payload size for received transport
@@ -63,12 +64,7 @@ func IsTransportError(err error, codes ...int32) bool {
 	if len(codes) == 0 {
 		return true
 	}
-	for _, c := range codes {
-		if te.Code == c {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(codes, te.Code)
 }
 
 // DetectTransportError checks whether a 4-byte payload is a transport error

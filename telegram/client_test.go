@@ -648,6 +648,47 @@ func TestResolvePeerLoadsChannelFromDialogs(t *testing.T) {
 	}
 }
 
+func TestResolvePeerBotResolvesBasicChatWithoutDialogs(t *testing.T) {
+	c, inv := newClientWithMock(t)
+	st := NewMemoryStorage()
+	if err := st.SetIsBot(true); err != nil {
+		t.Fatalf("SetIsBot() = %v", err)
+	}
+	c.storage = st
+
+	peer, err := c.ResolvePeer(context.Background(), int64(-12345))
+	if err != nil {
+		t.Fatalf("ResolvePeer() = %v", err)
+	}
+	chat, ok := peer.(*tg.InputPeerChat)
+	if !ok {
+		t.Fatalf("ResolvePeer() = %T, want *tg.InputPeerChat", peer)
+	}
+	if chat.ChatID != 12345 {
+		t.Errorf("ChatID = %d, want 12345", chat.ChatID)
+	}
+	if inv.callCount() != 0 {
+		t.Fatalf("ResolvePeer() made %d RPC calls, want 0", inv.callCount())
+	}
+}
+
+func TestResolvePeerBotDoesNotPreloadDialogsForChannel(t *testing.T) {
+	c, inv := newClientWithMock(t)
+	st := NewMemoryStorage()
+	if err := st.SetIsBot(true); err != nil {
+		t.Fatalf("SetIsBot() = %v", err)
+	}
+	c.storage = st
+
+	_, err := c.ResolvePeer(context.Background(), int64(-1004461866327))
+	if !errors.Is(err, ErrPeerNotFound) {
+		t.Fatalf("ResolvePeer() = %v, want ErrPeerNotFound", err)
+	}
+	if inv.callCount() != 0 {
+		t.Fatalf("ResolvePeer() made %d RPC calls, want 0", inv.callCount())
+	}
+}
+
 func TestExportSessionStringNotConnected(t *testing.T) {
 	c, _ := NewClient(12345, "hash", nil)
 	_, err := c.ExportSessionString()
