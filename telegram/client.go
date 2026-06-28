@@ -121,6 +121,13 @@ type Client struct {
 
 	dcSessions *dcSessions
 
+	// uploadPool is a lazily-created pool of sessions for upload traffic
+	// isolation. Each session has its own TCP connection but shares the main
+	// session's auth key, so upload.saveBigFilePart traffic doesn't compete
+	// with API calls and updates on the main session.
+	uploadPool      []*sideSession
+	uploadSessionMu sync.Mutex
+
 	// dcOptionPool manages candidate endpoints per DC with health scoring.
 	// Ported from td/td/telegram/net/DcOptionsSet.h.
 	dcOptionPool *session.DCOptionPool
@@ -1642,6 +1649,8 @@ func (c *Client) cleanupSessions(closeStorage ...bool) {
 	if c.dcSessions != nil {
 		c.dcSessions.cleanup()
 	}
+
+	c.stopUploadSession()
 
 	c.mu.Lock()
 	sess := c.session

@@ -107,7 +107,7 @@ func (c *Client) UploadFile(ctx context.Context, reader io.Reader, fileName stri
 		return nil, err
 	}
 	c.Log.Debugf("UploadFile size=%d", fileSize)
-	rpc := c.Raw()
+	rpc := c.uploadRPC()
 	inputFile, actualSize, err := uploadFileRPC(ctx, rpc, reader, fileName, fileSize, opts)
 	if err != nil {
 		return nil, err
@@ -201,12 +201,14 @@ func uploadFileStreamRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reade
 					totalParts = int32((job.totalSize + int64(uploadPartSize) - 1) / int64(uploadPartSize))
 				}
 
-				_, uploadErr := rpc.UploadSaveBigFilePart(ctx, &tg.UploadSaveBigFilePartRequest{
+				partCtx, partCancel := context.WithTimeout(ctx, uploadPartTimeout)
+				_, uploadErr := rpc.UploadSaveBigFilePart(partCtx, &tg.UploadSaveBigFilePartRequest{
 					FileID:         fileID,
 					FilePart:       job.idx,
 					FileTotalParts: totalParts,
 					Bytes:          job.data,
 				})
+				partCancel()
 
 				if job.bufPtr != nil {
 					uploadBufPool.Put(job.bufPtr)
@@ -362,20 +364,22 @@ func uploadFileKnownRPC(ctx context.Context, rpc *tg.RPCClient, reader io.Reader
 				}
 
 				var uploadErr error
+				partCtx, partCancel := context.WithTimeout(ctx, uploadPartTimeout)
 				if isBig {
-					_, uploadErr = rpc.UploadSaveBigFilePart(ctx, &tg.UploadSaveBigFilePartRequest{
+					_, uploadErr = rpc.UploadSaveBigFilePart(partCtx, &tg.UploadSaveBigFilePartRequest{
 						FileID:         fileID,
 						FilePart:       job.partIdx,
 						FileTotalParts: totalParts,
 						Bytes:          job.data,
 					})
 				} else {
-					_, uploadErr = rpc.UploadSaveFilePart(ctx, &tg.UploadSaveFilePartRequest{
+					_, uploadErr = rpc.UploadSaveFilePart(partCtx, &tg.UploadSaveFilePartRequest{
 						FileID:   fileID,
 						FilePart: job.partIdx,
 						Bytes:    job.data,
 					})
 				}
+				partCancel()
 
 				uploadBufPool.Put(job.bufPtr)
 
