@@ -279,6 +279,11 @@ type Download struct {
 	// lets the client choose a sensible default.
 	ChunkSize int32
 
+	// Workers controls the number of concurrent range requests used when the
+	// destination supports random writes. Values greater than 8 are clamped to
+	// 8. A value of 0 or 1 uses the serial downloader.
+	Workers int
+
 	// Progress is an optional callback invoked on each chunk transfer to
 	// report download progress. Nil disables progress reporting.
 	Progress ProgressFunc

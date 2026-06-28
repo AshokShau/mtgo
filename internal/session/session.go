@@ -677,6 +677,11 @@ func (s *Session) SetServerSalt(salt int64) {
 	s.saltMgr.StoreSimple(salt)
 }
 
+// ServerSalt returns the current server salt used for encrypted outgoing messages.
+func (s *Session) ServerSalt() int64 {
+	return s.saltMgr.Load()
+}
+
 // SetServerTime updates the internal message ID generator with the server's
 // reported time to keep message IDs monotonically increasing.
 func (s *Session) SetServerTime(t time.Time) {

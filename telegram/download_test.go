@@ -22,12 +22,14 @@ type mockDownloadInvoker struct {
 	offsets     atomic.Int32
 	err         error
 	cdnRedirect bool
+	failOnceAt  int64
 }
 
 func newMockDownloadInvoker(data []byte) *mockDownloadInvoker {
 	return &mockDownloadInvoker{
-		data:      data,
-		chunkSize: downloadChunkSize,
+		data:       data,
+		chunkSize:  downloadChunkSize,
+		failOnceAt: -1,
 	}
 }
 
@@ -52,6 +54,10 @@ func (m *mockDownloadInvoker) RPCInvoke(ctx context.Context, input tg.TLObject, 
 	}
 
 	offset := req.Offset
+	if m.failOnceAt >= 0 && offset == m.failOnceAt {
+		m.failOnceAt = -1
+		return nil, errors.New("send: session: closed")
+	}
 	limit := req.Limit
 
 	start := offset
@@ -240,6 +246,40 @@ func TestDownloadToWriterRetriesFileMigrate(t *testing.T) {
 	}
 	if got := buf.String(); got != string(data) {
 		t.Fatalf("downloaded %q, want %q", got, data)
+	}
+}
+
+func TestDownloadToWriterRecoversClosedDCSessionAtOffset(t *testing.T) {
+	data := make([]byte, downloadChunkSize*2+512)
+	_, _ = rand.Read(data)
+
+	c, _ := NewClient(1, "h", nil)
+	c.state.setConnected(true)
+	c.state.SetDC(2)
+
+	primary := newMockDownloadInvoker(data)
+	primary.failOnceAt = downloadChunkSize
+	recovered := newMockDownloadInvoker(data)
+	c.testInvoker = recovered
+
+	var buf bytes.Buffer
+	written, err := c.downloadToWriter(
+		context.Background(),
+		tg.NewRPCClient(primary),
+		0,
+		&tg.InputDocumentFileLocation{ID: 100, AccessHash: 200},
+		int64(len(data)),
+		&buf,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("downloadToWriter() error: %v", err)
+	}
+	if written != int64(len(data)) {
+		t.Fatalf("written = %d, want %d", written, len(data))
+	}
+	if !bytes.Equal(buf.Bytes(), data) {
+		t.Fatal("downloaded data does not match original")
 	}
 }
 

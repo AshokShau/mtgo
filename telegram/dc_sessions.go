@@ -17,15 +17,21 @@ type dcSessionEntry struct {
 	rpc    *tg.RPCClient
 }
 
+type dcSessionPool struct {
+	entries []*dcSessionEntry
+}
+
 type dcSessions struct {
 	mu        sync.Mutex
 	entries   map[int]*dcSessionEntry
+	pools     map[int]*dcSessionPool
 	initLocks map[int]*sync.Mutex
 }
 
 func newDCSessions() *dcSessions {
 	return &dcSessions{
 		entries:   make(map[int]*dcSessionEntry),
+		pools:     make(map[int]*dcSessionPool),
 		initLocks: make(map[int]*sync.Mutex),
 	}
 }
@@ -60,6 +66,52 @@ func (d *dcSessions) put(dcID int, e *dcSessionEntry) {
 	d.mu.Unlock()
 }
 
+func (d *dcSessions) getPool(dcID int, size int) (*dcSessionPool, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p, ok := d.pools[dcID]
+	if !ok || p == nil || len(p.entries) < size {
+		return nil, false
+	}
+	return p, true
+}
+
+func (d *dcSessions) putPool(dcID int, p *dcSessionPool) {
+	d.mu.Lock()
+	d.pools[dcID] = p
+	delete(d.initLocks, dcID)
+	d.mu.Unlock()
+}
+
+func (d *dcSessions) remove(dcID int) {
+	d.mu.Lock()
+	e := d.entries[dcID]
+	delete(d.entries, dcID)
+	p := d.pools[dcID]
+	delete(d.pools, dcID)
+	delete(d.initLocks, dcID)
+	d.mu.Unlock()
+
+	if e != nil {
+		if e.sess != nil {
+			e.sess.Stop()
+		}
+		if e.closer != nil {
+			e.closer.Close()
+		}
+	}
+	if p != nil {
+		for _, e := range p.entries {
+			if e.sess != nil {
+				e.sess.Stop()
+			}
+			if e.closer != nil {
+				e.closer.Close()
+			}
+		}
+	}
+}
+
 func (d *dcSessions) cleanup() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -69,7 +121,16 @@ func (d *dcSessions) cleanup() {
 			e.closer.Close()
 		}
 	}
+	for _, p := range d.pools {
+		for _, e := range p.entries {
+			e.sess.Stop()
+			if e.closer != nil {
+				e.closer.Close()
+			}
+		}
+	}
 	d.entries = make(map[int]*dcSessionEntry)
+	d.pools = make(map[int]*dcSessionPool)
 }
 
 func (c *Client) dcRPC(ctx context.Context, dcID int) (*tg.RPCClient, error) {
@@ -114,6 +175,142 @@ func (c *Client) dcRPC(ctx context.Context, dcID int) (*tg.RPCClient, error) {
 	return entry.rpc, nil
 }
 
+func (c *Client) dcRPCPool(ctx context.Context, dcID int, size int) ([]*tg.RPCClient, error) {
+	if size <= 1 || dcID <= 0 {
+		rpc, err := c.dcRPC(ctx, dcID)
+		if err != nil {
+			return nil, err
+		}
+		return []*tg.RPCClient{rpc}, nil
+	}
+
+	c.mu.RLock()
+	homeDC := c.state.DC()
+	c.mu.RUnlock()
+	// Same-DC: the main session multiplexes concurrent requests natively and
+	// has robust reconnection logic. Return it for every worker instead of
+	// creating fragile side sessions that share the auth key and cascade-fail
+	// when one is replaced (killing sessions other workers still use).
+	if dcID == homeDC {
+		mainRPC := c.Raw()
+		rpcs := make([]*tg.RPCClient, size)
+		for i := range rpcs {
+			rpcs[i] = mainRPC
+		}
+		return rpcs, nil
+	}
+
+	if pool, ok := c.dcSessions.getPool(dcID, size); ok {
+		rpcs := make([]*tg.RPCClient, size)
+		for i := range rpcs {
+			rpcs[i] = pool.entries[i].rpc
+		}
+		return rpcs, nil
+	}
+
+	initMu := c.dcSessions.getInitLock(dcID)
+	initMu.Lock()
+	defer initMu.Unlock()
+
+	if pool, ok := c.dcSessions.getPool(dcID, size); ok {
+		rpcs := make([]*tg.RPCClient, size)
+		for i := range rpcs {
+			rpcs[i] = pool.entries[i].rpc
+		}
+		return rpcs, nil
+	}
+
+	entries := make([]*dcSessionEntry, 0, size)
+	for i := 0; i < size; i++ {
+		entry, err := c.createDCSession(ctx, dcID)
+		if err != nil {
+			for _, e := range entries {
+				if e.sess != nil {
+					e.sess.Stop()
+				}
+				if e.closer != nil {
+					e.closer.Close()
+				}
+			}
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+
+	c.dcSessions.putPool(dcID, &dcSessionPool{entries: entries})
+
+	rpcs := make([]*tg.RPCClient, len(entries))
+	for i, e := range entries {
+		rpcs[i] = e.rpc
+	}
+	return rpcs, nil
+}
+
+func (c *Client) replaceDCRPCPoolEntry(ctx context.Context, dcID int, size int, idx int) (*tg.RPCClient, error) {
+	if size <= 1 || dcID <= 0 {
+		if dcID > 0 {
+			c.dcSessions.remove(dcID)
+		}
+		return c.dcRPC(ctx, dcID)
+	}
+
+	c.mu.RLock()
+	homeDC := c.state.DC()
+	c.mu.RUnlock()
+	// Same-DC: cannot replace the main session; return it as-is.
+	if dcID == homeDC {
+		return c.Raw(), nil
+	}
+
+	initMu := c.dcSessions.getInitLock(dcID)
+	initMu.Lock()
+	defer initMu.Unlock()
+
+	pool, ok := c.dcSessions.getPool(dcID, size)
+	if !ok {
+		entries := make([]*dcSessionEntry, 0, size)
+		for i := 0; i < size; i++ {
+			entry, err := c.createDCSession(ctx, dcID)
+			if err != nil {
+				for _, e := range entries {
+					if e.sess != nil {
+						e.sess.Stop()
+					}
+					if e.closer != nil {
+						e.closer.Close()
+					}
+				}
+				return nil, err
+			}
+			entries = append(entries, entry)
+		}
+		c.dcSessions.putPool(dcID, &dcSessionPool{entries: entries})
+		return entries[idx%len(entries)].rpc, nil
+	}
+
+	entry, err := c.createDCSession(ctx, dcID)
+	if err != nil {
+		return nil, err
+	}
+
+	idx %= len(pool.entries)
+	c.dcSessions.mu.Lock()
+	old := pool.entries[idx]
+	pool.entries[idx] = entry
+	c.dcSessions.mu.Unlock()
+
+	if old != nil {
+		if old.sess != nil {
+			old.sess.Stop()
+		}
+		if old.closer != nil {
+			old.closer.Close()
+		}
+	}
+
+	return entry.rpc, nil
+}
+
 func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry, error) {
 	dc := session.DataCenter{
 		ID:       dcID,
@@ -151,6 +348,7 @@ func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry
 	c.mu.RLock()
 	cfg := c.cfg
 	log := c.Log
+	mainSess := c.session
 	c.mu.RUnlock()
 
 	dcStorage := NewMemoryStorage()
@@ -161,6 +359,27 @@ func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry
 		return nil, fmt.Errorf("download: create session DC %d: %w", dcID, err)
 	}
 	configureSessionDispatch(sess, cfg, log)
+	sess.SetUpdateHandler(func(obj tg.TLObject) {})
+
+	if mainSess != nil && mainSess.DC().ID == dcID {
+		authKey := mainSess.AuthKey()
+		if len(authKey) == 0 {
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: no auth key for same-DC sender %d", dcID)
+		}
+		sess.SetAuthKey(authKey)
+		sess.SetServerSalt(mainSess.ServerSalt())
+		if err := sess.Connect(sessionTp, 15*time.Second); err != nil {
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: start same-DC session DC %d: %w", dcID, err)
+		}
+		c.Log.Infof("Same-DC session established for DC %d", dcID)
+		return &dcSessionEntry{
+			sess:   sess,
+			closer: sessionTp,
+			rpc:    tg.NewRPCClient(&dcSessionInvoker{sess: sess, client: c}),
+		}, nil
+	}
 
 	auth := &session.Auth{
 		DC:       dcID,
@@ -177,8 +396,6 @@ func (c *Client) createDCSession(ctx context.Context, dcID int) (*dcSessionEntry
 	sess.SetAuthKey(result.AuthKey)
 	sess.SetServerSalt(result.ServerSalt)
 	sess.SetServerTime(time.Unix(int64(result.ServerTime), 0))
-
-	sess.SetUpdateHandler(func(obj tg.TLObject) {})
 
 	if err := sess.Connect(sessionTp, 15*time.Second); err != nil {
 		sessionTp.Close()
