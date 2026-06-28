@@ -65,6 +65,12 @@ func (s *testServer) handleConn(conn net.Conn) {
 
 	authKeyID := computeAuthKeyID(s.authKey)
 
+	// Per-connection counter ensures unique response msg_ids. Without this,
+	// (time.Now().Unix()<<32)|1 collides when multiple responses are sent
+	// within the same second, and the client's msg_id replay validator
+	// silently drops the duplicate — causing RPC calls to hang.
+	var msgSeq int32
+
 	for {
 		select {
 		case <-s.done:
@@ -93,9 +99,10 @@ func (s *testServer) handleConn(conn net.Conn) {
 			return
 		}
 
+		msgSeq++
 		salt := int64(binary.LittleEndian.Uint64(decrypted[0:8]))
 		sessionID := decrypted[8:16]
-		respMsgID := (time.Now().Unix() << 32) | 1
+		respMsgID := (time.Now().Unix() << 32) | int64(msgSeq*4+1)
 		respSeqNo := uint32(0)
 		origMsgID := int64(binary.LittleEndian.Uint64(decrypted[16:24]))
 
