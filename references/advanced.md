@@ -363,3 +363,20 @@ mtgo-cli send-message my_test_bot "/start"
 # Trace shows: [1] >> messages.sendMessage / [1] << messages.sendMessage [45ms]
 # [2] UPDATE updateNewMessage from bot
 ```
+
+## File Transfer Performance
+
+File uploads and downloads are **parallelized by default** — large files are split into chunks and transferred concurrently for maximum throughput.
+
+- **Uploads** run on a **dedicated session** to avoid blocking update delivery and RPC calls on the main session. No configuration needed — this is automatic.
+- **Downloads** fan out across CDN and DC workers with cascade-kill safety for same-DC sessions.
+
+Control parallelism with the `MaxConcurrentTrans` Config field:
+
+```go
+client, _ := telegram.NewClient(apiID, apiHash, &telegram.Config{
+    MaxConcurrentTrans: 4, // limit to 4 concurrent chunk transfers (0 = unlimited)
+})
+```
+
+The `Progress` callback on `DownloadMedia` receives `ProgressInfo` with `DownloadedBytes` and `TotalBytes` for progress bars.

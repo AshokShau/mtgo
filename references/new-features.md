@@ -318,11 +318,52 @@ client.OnChosenInlineResult(func(ctx *telegram.Context, result *types.ChosenInli
 })
 ```
 
-## Error Handler
+## Typed Raw Update Handlers
 
-Register a handler for update processing errors:
+`OnRawUpdate` now supports type-safe callbacks. Instead of receiving a catch-all `*Context` and type-switching, pass a function with a concrete `*tg.UpdateXxx` parameter — the handler fires only for that update type:
 
 ```go
+// Typed — fires only for UpdateUserTyping
+client.OnRawUpdate(func(upd *tg.UpdateUserTyping) {
+    log.Printf("user %d is typing in %d", upd.UserID, upd.ChatID)
+})
+
+// Typed with context
+client.OnRawUpdate(func(ctx *telegram.Context, upd *tg.UpdatePhoneCall) {
+    log.Printf("phone call: %+v", upd)
+})
+
+// Typed with client
+client.OnRawUpdate(func(client *telegram.Client, upd *tg.UpdateDeleteMessages) {
+    log.Printf("messages deleted: %v", upd.Messages)
+})
+
+// Catch-all (backwards compatible)
+client.OnRawUpdate(func(ctx *telegram.Context) {
+    log.Printf("raw update: %T", ctx.Update.Raw)
+})
+```
+
+Pair with the `UpdateType[T]()` filter for type-safe filtering on catch-all handlers:
+
+```go
+client.OnRawUpdate(func(ctx *telegram.Context) {
+    upd := ctx.Update.Raw.(*tg.UpdateUserTyping)
+    // ...
+}, telegram.UpdateType[*tg.UpdateUserTyping]())
+```
+
+## Error Handler
+
+Register a handler for update processing errors. Optional exception types restrict the handler to specific error categories:
+
+```go
+// Catch all update errors
+client.OnError(func(ctx *telegram.Context) {
+    log.Printf("Update error: %v", ctx.Error)
+})
+
+// Or via AddHandler (equivalent)
 client.AddHandler(telegram.NewErrorHandler(func(ctx *telegram.Context) {
     log.Printf("Update error: %v", ctx.Error)
 }))
@@ -330,29 +371,21 @@ client.AddHandler(telegram.NewErrorHandler(func(ctx *telegram.Context) {
 
 ## Lifecycle Handlers
 
-React to client lifecycle events for initialization and cleanup:
+React to client lifecycle events. Register via direct `On*` methods or `AddHandler`:
 
 ```go
-// Runs after successful connection
-client.AddHandler(telegram.NewConnectHandler(func(ctx *telegram.Context) {
+// Direct registration (preferred)
+client.OnConnect(func(ctx *telegram.Context) {
     log.Println("Connected!")
     client.SendMessage(ctx.Ctx, adminChatID, "Bot is online", nil)
-}))
+})
+client.OnDisconnect(func(ctx *telegram.Context) { log.Println("Disconnected") })
+client.OnStart(func(ctx *telegram.Context) { log.Println("Starting up...") })
+client.OnStop(func(ctx *telegram.Context) { log.Println("Shutting down...") })
 
-// Runs on disconnection
-client.AddHandler(telegram.NewDisconnectHandler(func(ctx *telegram.Context) {
-    log.Println("Disconnected")
-}))
-
-// Runs at startup, before connection
-client.AddHandler(telegram.NewStartHandler(func(ctx *telegram.Context) {
-    log.Println("Starting up...")
-}))
-
-// Runs at shutdown
-client.AddHandler(telegram.NewStopHandler(func(ctx *telegram.Context) {
-    log.Println("Shutting down...")
-}))
+// Via AddHandler (equivalent)
+client.AddHandler(telegram.NewConnectHandler(func(ctx *telegram.Context) { ... }))
+client.AddHandler(telegram.NewStartHandler(func(ctx *telegram.Context) { ... }))
 ```
 
 The Context fields `Connected`, `Disconnected`, `Started`, and `Stopped` are set for lifecycle events.

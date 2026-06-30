@@ -188,7 +188,8 @@ client.OnChatJoinRequest(callback, filters...)
 client.OnChatBoost(callback, filters...)                 // boost added/removed
 
 // Content handlers
-client.OnMessageReaction(callback, filters...)
+client.OnMessageReaction(callback, filters...)           // reaction changes
+client.OnMessageReactionCount(callback, filters...)      // anonymous reaction counts
 client.OnPoll(callback, filters...)
 client.OnStory(callback, filters...)
 client.OnPurchasedPaidMedia(callback, filters...)        // paid media purchases
@@ -204,15 +205,24 @@ client.OnShippingQuery(callback, filters...)
 client.OnBusinessConnection(callback, filters...)        // business connection updates
 client.OnManagedBot(callback, filters...)                 // managed bot updates
 
-// Lifecycle handlers (register via AddHandler)
-client.AddHandler(telegram.NewConnectHandler(func(ctx *telegram.Context) { ... }))
-client.AddHandler(telegram.NewDisconnectHandler(func(ctx *telegram.Context) { ... }))
-client.AddHandler(telegram.NewStartHandler(func(ctx *telegram.Context) { ... }))
-client.AddHandler(telegram.NewStopHandler(func(ctx *telegram.Context) { ... }))
+// Lifecycle handlers
+client.OnConnect(func(ctx *telegram.Context) { ... })     // fires on each connect
+client.OnDisconnect(func(ctx *telegram.Context) { ... })  // fires on each disconnect
+client.OnStart(func(ctx *telegram.Context) { ... })        // fires once at startup
+client.OnStop(func(ctx *telegram.Context) { ... })         // fires at shutdown
 
-// Low-level
-client.OnRawUpdate(callback, filters...)                  // raw MTProto updates
-```
+// Error handler (optional exception types to restrict)
+client.OnError(func(ctx *telegram.Context) { ... })
+
+// Typed raw update handlers — type-safe, no manual type-switching
+client.OnRawUpdate(func(upd *tg.UpdateUserTyping) {
+    log.Printf("user %d is typing", upd.UserID)
+})
+// Catch-all raw updates
+client.OnRawUpdate(func(ctx *telegram.Context) { ... })
+
+// Remove a previously registered handler
+client.RemoveHandler(h)
 
 ### Handler callback signatures
 
@@ -272,11 +282,11 @@ client.OnMessage(handler, telegram.Private.And(telegram.HasText))
 
 **Chat type:** `Private`, `Group`, `Channel`, `Direct`, `Forum`, `Business`
 
-**Message content:** `HasText`, `Media`, `Photo`, `Video`, `Audio`, `Voice`, `VideoNote`, `Sticker`, `Animation`, `Document`, `Contact`, `Location`, `Venue`, `Poll`, `Game`, `Dice`, `Invoice`, `PaidMedia`, `WebPage`, `Caption`, `MediaGroup`, `MediaSpoiler`, `Story`, `Service`, `GuestMessage`
+**Message content:** `HasText`, `Media`, `HasMedia`, `Photo`, `Video`, `Audio`, `Voice`, `VideoNote`, `Sticker`, `Animation`, `Document`, `Contact`, `Location`, `LiveLocation`, `Venue`, `WebPage`, `Poll`, `Game`, `Dice`, `Invoice`, `PaidMedia`, `PaidMessage`, `Giveaway`, `GiveawayWinners`, `SuccessfulPayment`, `Caption`, `MediaGroup`, `MediaSpoiler`, `Story`, `ReplyKeyboard`, `InlineKeyboard`, `Service`, `GuestMessage`
 
 **Message properties:** `Incoming`, `Outgoing`, `Me`, `Bot`, `Forwarded`, `Reply`, `Mentioned`, `ViaBot`, `Pinned`, `LinkedChannel`, `SelfDestruction`
 
-**Service messages:** `NewChatMembers`, `LeftChatMember`, `NewChatTitle`, `NewChatPhoto`, `DeleteChatPhoto`, `GroupChatCreated`, `SupergroupChatCreated`, `ChannelChatCreated`, `PinnedMessage`, `VideoChatStarted`, `VideoChatEnded`, `GameHighScore`
+**Service messages:** `NewChatMembers`, `LeftChatMember`, `NewChatTitle`, `NewChatPhoto`, `DeleteChatPhoto`, `GroupChatCreated`, `SupergroupChatCreated`, `ChannelChatCreated`, `MigrateToChatID`, `MigrateFromChatID`, `PinnedMessage`, `VideoChatStarted`, `VideoChatEnded`, `VideoChatMembersInvited`, `GameHighScore`
 
 **Parameterized filters:**
 ```go
@@ -291,6 +301,7 @@ telegram.CallbackData("approve")
 telegram.CallbackRegex(`^page_\d+$`)
 telegram.InlineQueryText("search")
 telegram.NewCommand([]string{"start"}, []string{"/", "!"}, false)
+telegram.UpdateType[*tg.UpdateUserTyping]()              // type-safe raw update filter
 telegram.Create(func(c *telegram.Client, ctx *telegram.Context) bool {
     return isAdmin(c, ctx.Message.FromID)
 })
