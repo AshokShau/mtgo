@@ -318,6 +318,9 @@ func (c *Client) reconnectOnce() error {
 		}
 	}
 
+	// Notify reconnect hooks for plugin-driven gap recovery.
+	c.fireReconnect()
+
 	return nil
 }
 
