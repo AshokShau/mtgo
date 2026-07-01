@@ -45,6 +45,8 @@ jobs:
             modules: "."
           - repo: session-converter
             modules: "."
+          - repo: device-manager
+            modules: "."
           - repo: plugins
             modules: "conversations i18n scheduler fsm throttle updatesrecovery rawdebug"
           - repo: plugins-template
