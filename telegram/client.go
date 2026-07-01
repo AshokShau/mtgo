@@ -291,6 +291,8 @@ func NewClient(apiID int32, apiHash string, cfg *Config) (*Client, error) {
 		})
 	}
 
+
+	client.initDeviceStorage()
 	registerClient(client)
 
 	return client, nil

@@ -36,6 +36,7 @@ go doc github.com/mtgo-labs/mtgo/telegram/params SendMessage
 - `github.com/mtgo-labs/plugins/i18n` — internationalization plugin
 - `github.com/mtgo-labs/middlewares/floodwait` — flood wait auto-retry middleware
 - `github.com/mtgo-labs/middlewares/ratelimit` — rate limiting middleware
+- `github.com/mtgo-labs/session-converter` — convert session strings between Telethon, Pyrogram, GramJS, mtcute, MTKruto, gogram, gotgproto + SQLite import
 
 For advanced topics (full Config reference, userbot auth, group management, BotFather, testing), see `references/advanced.md`.
 For newer features (business connections, secret chats, gifts, live broadcasting, TDLib JSON, account privacy, lifecycle handlers), see `references/new-features.md`.

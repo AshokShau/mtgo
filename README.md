@@ -393,6 +393,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 | [mtgo-cli](https://github.com/mtgo-labs/mtgo-cli) | Fast MTProto CLI — invoke TL methods, test bots, manage groups from the terminal |
 | [mtgo-bot-api](https://github.com/mtgo-labs/mtgo-bot-api) | Self-hosted Bot API server — drop-in Go reimplementation of the official Telegram Bot API |
 | [mtgo-ipc](https://github.com/mtgo-labs/mtgo-ipc) | Standalone IPC bridge — JSON-RPC over Unix socket, lets any language drive mtgo |
+| [session-converter](https://github.com/mtgo-labs/session-converter) | Convert session strings between Telethon, Pyrogram, GramJS, mtcute, MTKruto, gogram, gotgproto + SQLite import |
 | [storage](https://github.com/mtgo-labs/storage) | Persistent storage adapters (SQLite, PostgreSQL, MongoDB) |
 | [plugins](https://github.com/mtgo-labs/plugins) | Official plugins (conversations, i18n) |
 | [middlewares](https://github.com/mtgo-labs/middlewares) | Invoker middleware (flood wait, rate limiting) |

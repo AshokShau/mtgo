@@ -29,6 +29,8 @@ type (
 	Adapter           = extstorage.Adapter
 	DCAuthEntry       = extstorage.DCAuthEntry
 	DCAuthStore       = extstorage.DCAuthStore
+	DeviceEntry       = extstorage.DeviceEntry
+	DeviceStore       = extstorage.DeviceStore
 )
 
 const (

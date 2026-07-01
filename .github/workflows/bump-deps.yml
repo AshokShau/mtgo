@@ -43,6 +43,8 @@ jobs:
             modules: "."
           - repo: mtgo-ipc
             modules: "."
+          - repo: session-converter
+            modules: "."
           - repo: plugins
             modules: "conversations i18n scheduler fsm throttle updatesrecovery rawdebug"
           - repo: plugins-template
