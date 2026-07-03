@@ -402,11 +402,35 @@ func (m *memoryBuffer) Bytes() []byte {
 	return m.data
 }
 
-func downloadToFileRPC(ctx context.Context, rpc *tg.RPCClient, location tg.InputFileLocationClass, fileSize int64, writer io.Writer, opts *params.Download) (int64, *tg.UploadFileCDNRedirect, error) {
-	chunkSize := int32(downloadChunkSize)
-	if opts != nil && opts.ChunkSize > 0 {
-		chunkSize = opts.ChunkSize
+// validateDownloadChunkSize ensures size satisfies Telegram's upload.getFile
+// limit constraint: must be a multiple of 4096 and in [4096, 1 MiB]. If size
+// is zero or negative, downloadChunkSize is returned.
+func validateDownloadChunkSize(size int32) int32 {
+	const (
+		minDownloadChunk = 4096
+		maxDownloadChunk = 1 << 20
+	)
+	if size <= 0 {
+		return int32(downloadChunkSize)
 	}
+	if size < minDownloadChunk {
+		return minDownloadChunk
+	}
+	if size > maxDownloadChunk {
+		return maxDownloadChunk
+	}
+	return size - size%minDownloadChunk
+}
+
+func chunkSizeForDownload(opts *params.Download) int32 {
+	if opts != nil {
+		return validateDownloadChunkSize(opts.ChunkSize)
+	}
+	return int32(downloadChunkSize)
+}
+
+func downloadToFileRPC(ctx context.Context, rpc *tg.RPCClient, location tg.InputFileLocationClass, fileSize int64, writer io.Writer, opts *params.Download) (int64, *tg.UploadFileCDNRedirect, error) {
+	chunkSize := chunkSizeForDownload(opts)
 
 	var totalWritten int64
 	offset := int64(0)
@@ -531,10 +555,7 @@ func downloadPoolSize(opts *params.Download, fileSize int64, dcID int, homeDC in
 }
 
 func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, dcID int, location tg.InputFileLocationClass, fileSize int64, writer io.WriterAt, opts *params.Download) (int64, error) {
-	chunkSize := int32(downloadChunkSize)
-	if opts != nil && opts.ChunkSize > 0 {
-		chunkSize = opts.ChunkSize
-	}
+	chunkSize := chunkSizeForDownload(opts)
 
 	workers := downloadWorkers(opts, fileSize, dcID, c.homeDC())
 	ctx, cancel := context.WithCancel(ctx)
@@ -630,12 +651,13 @@ func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, d
 	go func() {
 		defer close(jobs)
 		for offset := int64(0); offset < fileSize; offset += int64(chunkSize) {
-			limit := chunkSize
-			if remaining := fileSize - offset; remaining < int64(limit) {
-				limit = int32(remaining)
-			}
+			// Always request the full chunk size. Telegram requires the limit
+			// to be a multiple of 4096; clamping it to the remaining file size
+			// would produce a non-aligned limit and trigger LIMIT_INVALID.
+			// The server returns fewer bytes for the final chunk (short read),
+			// and the expected-byte check below already accounts for that.
 			select {
-			case jobs <- job{offset: offset, limit: limit}:
+			case jobs <- job{offset: offset, limit: chunkSize}:
 			case <-ctx.Done():
 				return
 			}
@@ -692,10 +714,7 @@ func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, d
 }
 
 func (c *Client) downloadToWriterFromOffset(ctx context.Context, rpc *tg.RPCClient, dcID int, location tg.InputFileLocationClass, fileSize int64, writer io.Writer, opts *params.Download, offset int64) (int64, error) {
-	chunkSize := int32(downloadChunkSize)
-	if opts != nil && opts.ChunkSize > 0 {
-		chunkSize = opts.ChunkSize
-	}
+	chunkSize := chunkSizeForDownload(opts)
 
 	totalWritten := offset
 	recoveries := 0
@@ -839,10 +858,7 @@ func streamFileRPC(ctx context.Context, rpc *tg.RPCClient, location tg.InputFile
 }
 
 func streamFileRPCWithMigration(ctx context.Context, rpc *tg.RPCClient, location tg.InputFileLocationClass, fileSize int64, opts *params.Download, migrate func(written int64, err error) (*tg.RPCClient, bool, error)) (<-chan FileChunk, error) {
-	chunkSize := int32(downloadChunkSize)
-	if opts != nil && opts.ChunkSize > 0 {
-		chunkSize = opts.ChunkSize
-	}
+	chunkSize := chunkSizeForDownload(opts)
 
 	ch := make(chan FileChunk, 2)
 
@@ -939,10 +955,7 @@ func (c *Client) downloadCDNToWriter(ctx context.Context, redirect *tg.UploadFil
 		return 0, fmt.Errorf("cdn: connect to dc %d: %w", redirect.DCID, err)
 	}
 
-	chunkSize := int32(downloadChunkSize)
-	if opts != nil && opts.ChunkSize > 0 {
-		chunkSize = opts.ChunkSize
-	}
+	chunkSize := chunkSizeForDownload(opts)
 
 	key := redirect.EncryptionKey
 	iv := make([]byte, len(redirect.EncryptionIv))
